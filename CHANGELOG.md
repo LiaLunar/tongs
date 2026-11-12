@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.34.0](https://github.com/happy-dwarf-team/tongs/compare/v0.33.0...v0.34.0) (2026-11-12)
+
+
+### Features
+
+* **pipe:** pending events in country, through anvil-game.world ([#192](https://github.com/happy-dwarf-team/tongs/issues/192)) ([a1905d8](https://github.com/happy-dwarf-team/tongs/commit/a1905d8930e4cf0b85af76d433be2a86fb7da574))
+
 ## [0.33.0](https://github.com/happy-dwarf-team/tongs/compare/v0.32.0...v0.33.0) (2026-11-12)
 
 ### Features
