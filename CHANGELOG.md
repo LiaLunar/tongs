@@ -5,7 +5,7 @@
 
 ### Features
 
-* **pipe:** pending events in country, through anvil-game.world ([#192](https://github.com/happy-dwarf-team/tongs/issues/192)) ([a1905d8](https://github.com/happy-dwarf-team/tongs/commit/a1905d8930e4cf0b85af76d433be2a86fb7da574))
+* **pipe:** `country TAG` (`tongs_country` in MCP) also lists the events waiting for that country's choice, with the id `event choose` uses, the event's key, its province and the date the game chooses for the player. This needs Anvil 1.21; with an older Anvil the list is `null`. ([#192](https://github.com/happy-dwarf-team/tongs/issues/192)) ([a1905d8](https://github.com/happy-dwarf-team/tongs/commit/a1905d8930e4cf0b85af76d433be2a86fb7da574))
 
 ## [0.33.0](https://github.com/happy-dwarf-team/tongs/compare/v0.32.0...v0.33.0) (2026-11-12)
 
