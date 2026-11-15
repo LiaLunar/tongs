@@ -1377,6 +1377,37 @@ static void TestWindowAndMouse() {
     out = HandleRequest("click 6 6 right mods=ctrl+alt", h);
     assert(Contains(out, "\"mods\":\"ctrl+alt\"") && game.events.size() == 7 && game.events[3].button == 3 &&
            game.events[5].key.scancode == 226 && game.events[6].key.scancode == 224);
+    const auto key_down_sent = [](const std::vector<InputEvent>& events) {
+        return std::any_of(events.begin(), events.end(), [](const InputEvent& e) { return e.type == InputEvent::Type::KeyDown; });
+    };
+    // The window is minimized while Shift is held: the press is refused, but Shift still comes up.
+    game.events.clear();
+    game.on_sleep = [&] {
+        if (key_down_sent(game.events)) game.window.minimized = true;
+    };
+    out = HandleRequest("click 6 6 mods=shift", h);
+    game.on_sleep = nullptr;
+    game.window.minimized = false;
+    assert(Contains(out, "\"ok\":false") && Contains(out, "minimized") && !Contains(out, "not released"));
+    assert(game.events.size() == 3 && game.events[1].type == InputEvent::Type::KeyDown &&
+           game.events[2].type == InputEvent::Type::KeyUp && game.events[2].key.scancode == 225 &&
+           game.events[2].key.mod == 0);
+    // Pressing the modifiers fails partway (Ctrl went down, Shift did not): both come up, and no press.
+    game.events.clear();
+    Handlers partway = h;
+    partway.send_input = [&game](const std::vector<InputEvent>& batch) -> std::string {
+        for (const InputEvent& e : batch) {
+            if (e.type == InputEvent::Type::KeyDown && e.key.scancode == 225) return "SDL_PushEvent failed";
+            game.events.push_back(e);
+        }
+        return {};
+    };
+    out = HandleRequest("click 6 6 mods=ctrl+shift", partway);
+    assert(Contains(out, "\"ok\":false") && Contains(out, "SDL_PushEvent failed") && !Contains(out, "not released"));
+    assert(game.events.size() == 4 && game.events[1].type == InputEvent::Type::KeyDown &&
+           game.events[1].key.scancode == 224 && game.events[2].type == InputEvent::Type::KeyUp &&
+           game.events[2].key.scancode == 225 && game.events[3].type == InputEvent::Type::KeyUp &&
+           game.events[3].key.scancode == 224 && game.events[3].key.mod == 0);
 
     game.events.clear();
     std::size_t sent_before_first_sleep = 0;
@@ -1926,6 +1957,34 @@ static void TestUiClickCommand() {
            screen.game.events[1].type == InputEvent::Type::KeyDown && screen.game.events[1].key.scancode == 225 &&
            screen.game.events[2].type == InputEvent::Type::MouseDown &&
            screen.game.events[4].type == InputEvent::Type::KeyUp && screen.game.events[4].key.mod == 0);
+    // Pressing the modifiers fails partway: the keys already down come up, and there is no press.
+    screen.game.events.clear();
+    Handlers partway = h;
+    partway.send_input = [&screen](const std::vector<InputEvent>& batch) -> std::string {
+        for (const InputEvent& e : batch) {
+            if (e.type == InputEvent::Type::KeyDown && e.key.scancode == 225) return "SDL_PushEvent failed";
+            screen.game.events.push_back(e);
+        }
+        return {};
+    };
+    out = HandleRequest("ui click speed_controls/button_speedup mods=ctrl+shift", partway);
+    assert(Contains(out, "\"ok\":false") && Contains(out, "SDL_PushEvent failed"));
+    assert(screen.game.events.size() == 4 && screen.game.events[1].key.scancode == 224 &&
+           screen.game.events[2].type == InputEvent::Type::KeyUp && screen.game.events[3].type == InputEvent::Type::KeyUp &&
+           screen.game.events[3].key.scancode == 224);
+    // The window is minimized while Shift is held: the press is refused, but Shift still comes up.
+    screen.game.events.clear();
+    screen.game.on_sleep = [&screen] {
+        for (const InputEvent& e : screen.game.events) {
+            if (e.type == InputEvent::Type::KeyDown) screen.game.window.minimized = true;
+        }
+    };
+    out = HandleRequest("ui click speed_controls/button_speedup mods=shift", h);
+    screen.game.on_sleep = nullptr;
+    screen.game.window.minimized = false;
+    assert(Contains(out, "\"ok\":false") && Contains(out, "minimized"));
+    assert(screen.game.events.size() == 3 && screen.game.events[1].type == InputEvent::Type::KeyDown &&
+           screen.game.events[2].type == InputEvent::Type::KeyUp && screen.game.events[2].key.scancode == 225);
     screen.game.events.clear();
     out = HandleRequest("ui click speed_controls/button_speeddown", h);
     assert(Contains(out, "{\"ok\":false,\"error\":\"disabled\"") && Contains(out, "\"path\":\"speed_controls/button_speeddown\""));

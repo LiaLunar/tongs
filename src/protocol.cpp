@@ -654,7 +654,13 @@ std::string MouseCommand(const Handlers& h, std::string_view command, std::strin
         // click: the modifier keys go down a few frames before the press and up after it settled.
         extra += ",\"mods\":\"" + ModifiersText(mods) + "\"";  // only a-z and +
         ActionResult held = actions.Settled(ModifierEvents(mods, true), 0);
-        if (!held.ok) return ActionJson(command, held);
+        if (!held.ok) {
+            // The keys go down one event at a time: a failure partway leaves the first ones down.
+            if (std::string error = h.send_input(ModifierEvents(mods, false)); !error.empty()) {
+                held.error += "; the modifier keys were not released: " + error;
+            }
+            return ActionJson(command, held);
+        }
         ActionResult clicked = actions.Settled(presses, count, extra);
         if (std::string error = h.send_input(ModifierEvents(mods, false)); !error.empty() && clicked.ok) {
             clicked.ok = false;
@@ -944,7 +950,13 @@ ClickOutcome ClickWidget(const Handlers& h, std::uintptr_t target, const UiRect&
     if (mods != 0) {
         // Held from a few frames before the press until the click settled (see MouseCommand).
         c.members += ",\"mods\":" + Quote(ModifiersText(mods));
-        if (std::string error = h.send_input(ModifierEvents(mods, true)); !error.empty()) return fail(error);
+        if (std::string error = h.send_input(ModifierEvents(mods, true)); !error.empty()) {
+            // The keys go down one event at a time: a failure partway leaves the first ones down.
+            if (std::string released = h.send_input(ModifierEvents(mods, false)); !released.empty()) {
+                error += "; the modifier keys were not released: " + released;
+            }
+            return fail(error);
+        }
         h.sleep_ms(kClickMoveSettleMs);
     }
     std::string error = h.send_input({down, up});

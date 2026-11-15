@@ -183,7 +183,8 @@ gate applies the rules of the type, in this order:
    - an input counts once in `inputs`, when it ends, if anything was sent,
      pressed, posted or chosen through the handlers the gate gives it; a part
      of one counts under its own name (`run_until events=first: choice`); input
-     through the event queue is refused while the window is minimized;
+     through the event queue is refused while the window is minimized,
+     except a batch of key-ups alone (the release of keys a click held);
      `run_until`'s own presses go through the request's handlers and are not
      counted (ADR 0005);
    - a client call or game call counts once in `client_calls` or `game_calls`
@@ -3816,7 +3817,12 @@ frames), queues the press and release, waits the usual settle time with the
 keys still held, then queues the `SDL_KEYUP` in reverse. Holding them across
 frames keeps the keys down even when the game handles the click later in the
 frame than its event loop. `ui click` holds them only after its hover check,
-so a refusal presses no key; the keys come up also when the press fails.
+so a refusal presses no key. Once a modifier key went down, the key-ups of all
+of them go out on every path: after the click, when the press fails, and when
+pressing the modifiers fails partway (the events are queued one at a time, so
+the first keys may be down). Input is refused while the game window is
+minimized, but a batch of key-ups alone is always sent, so a window minimized
+while the keys are held does not leave Shift or Ctrl down.
 
 Live check (2026-11-15, Steam 1.37.5 under Proton, Russia 1719): a click on the
 map icon of the army in Caceres, then `click 1110 633 mods=shift` on the one in
