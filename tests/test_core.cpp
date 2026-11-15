@@ -1452,6 +1452,13 @@ static void TestScreenshot() {
     std::string out = HandleRequest("screenshot menu", h);
     assert(asked == "menu" && Contains(out, "\"ok\":true") && Contains(out, "screenshots\\\\menu.png"));
     assert(Contains(out, "\"width\":1920") && Contains(out, "\"method\":\"print_window\"") && Contains(out, "\"blank\":false"));
+    assert(!Contains(out, "present_error"));  // only where the frame at Present was tried and failed
+    shot.blank = true;
+    shot.present_error = "Anvil suspended \"Tongs\"";
+    out = HandleRequest("screenshot menu", h);
+    assert(Contains(out, "\"blank\":true,\"present_error\":\"Anvil suspended \\\"Tongs\\\"\"}"));
+    shot.blank = false;
+    shot.present_error.clear();
     HandleRequest("screenshot", h);
     assert(asked.empty());
     for (const char* bad : {"screenshot ../x", "screenshot a b", "screenshot a.png",

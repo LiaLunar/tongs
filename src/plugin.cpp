@@ -15,6 +15,7 @@
 #include "game_speed_buttons.hpp"
 #include "game_navigation_service.hpp"
 #include "game_save.hpp"
+#include "game_present.hpp"
 #include "game_state.hpp"
 #include "game_symbols.hpp"
 #include "game_threads.hpp"
@@ -217,8 +218,20 @@ struct Tongs : anvil::Plugin {
             return tongs::CallSetMapMode(image_base, session, number, fault_code);
         };
         handlers.read_window = [] { return tongs::ReadGameWindow(); };
+        // The frame at the game's own Present: the capture that works under Wine and Proton. Only
+        // there: on Windows GDI sees the frame, and the hook would be one more on every frame.
+        if (tongs::RunningUnderWine()) {
+            if (const std::string error = tongs::HookPresent(); !error.empty()) {
+                host.warn("{}; screenshot uses only PrintWindow and the screen copy", error);
+            }
+        }
         handlers.take_screenshot = [folder = data_dir / "screenshots"](std::string_view name) {
-            return tongs::TakeScreenshot(folder, name);
+            // Anvil takes Tongs' hooks out while it suspends it, so the Present hook would never answer.
+            const bool suspended = g_suspended.load(std::memory_order_acquire);
+            return tongs::TakeScreenshot(folder, name,
+                                         suspended ? "Anvil suspended Tongs in this ironman or multiplayer game, so "
+                                                     "its Present hook does not run"
+                                                   : "");
         };
         const tongs::ThreadsLayout threads_layout;
         handlers.read_threads = [image_base, threads_layout] {
