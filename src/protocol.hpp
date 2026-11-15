@@ -97,6 +97,7 @@ struct ScreenshotResult {
     std::uint64_t bytes = 0;
     std::string method;    // "present", "print_window" or "screen"
     bool blank = false;    // every pixel black: the capture probably failed
+    std::string present_error;  // why the frame at Present gave no picture (only where it is tried)
 };
 
 // The top bar's speed and pause buttons (ADR 0005). Pause toggles the player pause.

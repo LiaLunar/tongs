@@ -2680,7 +2680,9 @@ std::string ScreenshotCommand(const Request& r) {
     if (!shot.ok) return Error(shot.error);
     return "{\"ok\":true,\"command\":\"screenshot\",\"path\":\"" + JsonEscape(shot.path) + "\",\"width\":" +
            std::to_string(shot.width) + ",\"height\":" + std::to_string(shot.height) + ",\"bytes\":" +
-           std::to_string(shot.bytes) + ",\"method\":\"" + shot.method + "\",\"blank\":" + Bool(shot.blank) + "}";
+           std::to_string(shot.bytes) + ",\"method\":\"" + shot.method + "\",\"blank\":" + Bool(shot.blank) +
+           (shot.present_error.empty() ? std::string() : ",\"present_error\":\"" + JsonEscape(shot.present_error) + "\"") +
+           "}";
 }
 
 std::string JournalCommand(const Request& r) {

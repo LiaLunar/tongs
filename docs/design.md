@@ -630,9 +630,10 @@ change them.
 `PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT)` into a 32-bit DIB, with a
 copy from the screen as fallback when the result is all black; PNG through
 WIC, into `anvil/data/tongs/screenshots/`, the newest 100 kept. Under Wine
-(Proton included) the frame at Present comes first (below); on Windows it is
-the last try, when both other captures are all black. `method` names the
-capture that gave the picture: `present`, `print_window` or `screen`.
+(Proton included) the frame at Present comes first (below); on Windows there
+is no Present hook. `method` names the capture that gave the picture:
+`present`, `print_window` or `screen`; `present_error`, only under Wine, says
+why the frame at Present gave none.
 
 ### The frame at Present (2026-11-15)
 
@@ -660,10 +661,19 @@ window being covered or the session type. It needs only the COM interface of
 the device the game passes, so Tongs neither links `d3d9.lib` nor makes a
 device of its own.
 
-Tongs tells Wine apart by `wine_get_version` in `ntdll.dll`, which Wine and
-Proton export and Windows does not. On Windows the order stays as it was
-(`print_window`, then `screen`), and the frame at Present is only the last try,
-when both are all black; that path was not run on Windows.
+Tongs tells Wine apart by `wine_get_version` in `ntdll.dll` (`RunningUnderWine`),
+which Wine and Proton export and Windows does not, and installs the hook only
+there. On Windows the capture stays as it was (`print_window`, then `screen`),
+and no hook runs on the game's frames.
+
+While Anvil suspends Tongs (an ironman or multiplayer game the player did not
+allow it in), Anvil takes its hooks out, so the hook would never answer.
+`screenshot` then does not wait for it: it goes straight to `print_window` and
+`screen` and says so in `present_error`. The fallback is black under Wayland,
+so such an answer is `blank: true` with the reason. When the frame at Present
+fails in another way (no frame within 3 s, a Direct3D error, an all-black
+frame), `present_error` carries that text, also when the fallback gave a
+picture.
 
 Live check (2026-11-15, Steam 1.37.5 under Proton, Wayland session, 1920x1080
 borderless): `screenshot` answered `method: present`, `blank: false` on the

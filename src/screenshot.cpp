@@ -37,12 +37,6 @@ struct Pixels {
 
 constexpr int kPresentTimeoutMs = 3000;  // a frame comes every few ms; a save load can hold one back
 
-// Wine (and Proton) export wine_get_version from ntdll; Windows does not.
-bool UnderWine() {
-    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-    return ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr;
-}
-
 // The game's own frame, copied from its back buffer right before Present.
 bool CapturePresent(Pixels& out, std::string& error) {
     FramePixels frame;
@@ -167,7 +161,8 @@ void Prune(const std::filesystem::path& folder) {
 
 }  // namespace
 
-ScreenshotResult TakeScreenshot(const std::filesystem::path& folder, std::string_view name) {
+ScreenshotResult TakeScreenshot(const std::filesystem::path& folder, std::string_view name,
+                                std::string_view present_off) {
     ScreenshotResult r;
     const WindowSnapshot w = ReadGameWindow();
     if (!w.found) {
@@ -180,14 +175,18 @@ ScreenshotResult TakeScreenshot(const std::filesystem::path& folder, std::string
     }
     const HWND hwnd = reinterpret_cast<HWND>(w.handle);
     Pixels px;
-    std::string present_error;
     // Under Wine the game draws through Vulkan (DXVK): GDI sees no frame, and the screen copy
-    // reads the X root window, black under Wayland. The back buffer at Present has it.
-    const bool wine = UnderWine();
+    // reads the X root window, black under Wayland. The back buffer at Present has it. The hook
+    // is installed only under Wine (plugin.cpp), so on Windows this is the path of before.
     bool captured = false;
-    if (wine && PresentHooked()) {
-        r.method = "present";
-        captured = CapturePresent(px, present_error) && !AllBlack(px);
+    if (PresentHooked()) {
+        if (!present_off.empty()) {
+            r.present_error = std::string(present_off);  // the hook does not run: do not wait for it
+        } else if (CapturePresent(px, r.present_error)) {
+            r.method = "present";
+            captured = !AllBlack(px);
+            if (!captured) r.present_error = "the frame at Present was all black";
+        }
     }
     if (!captured) {
         px = {};
@@ -198,16 +197,8 @@ ScreenshotResult TakeScreenshot(const std::filesystem::path& folder, std::string
             px = {};
             if (!Capture(hwnd, w, true, px)) {
                 r.error = "neither PrintWindow nor a screen copy worked";
-                if (!present_error.empty()) r.error += "; the frame at Present: " + present_error;
+                if (!r.present_error.empty()) r.error += "; the frame at Present: " + r.present_error;
                 return r;
-            }
-        }
-        // Both black on Windows too: the frame at Present is the last try.
-        if (AllBlack(px) && !wine && PresentHooked()) {
-            Pixels frame;
-            if (CapturePresent(frame, present_error) && !AllBlack(frame)) {
-                px = std::move(frame);
-                r.method = "present";
             }
         }
     }
