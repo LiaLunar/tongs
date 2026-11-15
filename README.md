@@ -221,12 +221,18 @@ game_calls_ironman = false      # game calls in ironman (Anvil must also allow T
 game_calls_multiplayer = false  # game calls in multiplayer (likewise)
 journal = true      # the command journal in anvil/data/tongs/journal/ (on by default)
 bridge = true       # under Wine and Proton: also serve a loopback socket for native Linux clients
+instance = "host"   # only with several games on one computer: the pipe becomes \\.\pipe\tongs-host
 ```
 
 Tongs reads them when the game starts. `ANVIL_TONGS_<NAME>` environment
 variables (for example `ANVIL_TONGS_ENABLED=true`) override a value for one
 start, without changing the file. An `anvil/data/tongs/config.toml` from Tongs
 0.12 or older is moved into `settings.toml` on the first start.
+
+To drive several games on one computer, give each its own `instance` (for
+example `ANVIL_TONGS_INSTANCE=guest` for one start) and point each client at it
+with `TONGS_INSTANCE=guest` or `--instance guest`; see
+[docs/design.md](docs/design.md), "Several games on one computer".
 
 With Anvil 1.20 or newer, the Anvil panel and Anvil Manager show these settings and Tongs' description in the player's
 language: French, German, Spanish, Simplified and Traditional Chinese, Japanese, Korean or

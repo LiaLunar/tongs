@@ -20,6 +20,8 @@ status = "draft"            # "checked" once a native speaker checked it
 "Game calls in an ironman game. Anvil also has to allow Tongs in ironman (allow_ironman = [\"tongs\"] in anvil/anvil.toml)." = "アイアンマンのゲームでのゲーム呼び出し。Anvil でもアイアンマンでの Tongs を許可する必要があります（anvil/anvil.toml に allow_ironman = [\"tongs\"]）。"
 "Game calls in multiplayer" = "マルチプレイでのゲーム呼び出し"
 "Game calls in a multiplayer game. Anvil also has to allow Tongs in multiplayer (allow_multiplayer = [\"tongs\"] in anvil/anvil.toml)." = "マルチプレイのゲームでのゲーム呼び出し。Anvil でもマルチプレイでの Tongs を許可する必要があります（anvil/anvil.toml に allow_multiplayer = [\"tongs\"]）。"
+"Instance name" = "インスタンス名"
+"Leave empty for one game. To run several games on one computer, give each a different name of up to 32 letters, digits, _ or -: its pipe becomes \\\\.\\pipe\\tongs-NAME, and under Wine its bridge.json goes to a folder NAME below the default one. Clients choose the game with TONGS_INSTANCE=NAME or --instance NAME." = "ゲームを1つだけ動かす場合は空欄のままにします。1台のコンピューターで複数のゲームを動かすには、それぞれに異なる名前（英字、数字、_、- の最大32文字）を付けます。そのゲームのパイプは \\\\.\\pipe\\tongs-NAME になり、Wine では bridge.json が既定のフォルダーの下の NAME フォルダーに置かれます。クライアントは TONGS_INSTANCE=NAME または --instance NAME でゲームを選びます。"
 "Loopback socket under Wine" = "Wine 下のループバックソケット"
 "Under Wine and Proton, also serves the pipe's commands on a socket on 127.0.0.1, so that a native Linux client can reach Tongs without a relay. It needs Open the pipe. The port and a token go to bridge.json in the folder below, which only you should be able to enter. Ignored on Windows." = "Wine と Proton の下で、パイプのコマンドを 127.0.0.1 のソケットでも提供し、ネイティブ Linux のクライアントがリレーなしで Tongs に接続できるようにします。「パイプを開く」が必要です。ポートとトークンは下のフォルダーの bridge.json に書かれます。そのフォルダーには自分だけが入れるようにしてください。Windows では無視されます。"
 "Folder of bridge.json" = "bridge.json のフォルダー"
