@@ -1,5 +1,6 @@
 #include "screenshot.hpp"
 
+#include "game_present.hpp"
 #include "game_window.hpp"
 
 #include <windows.h>
@@ -33,6 +34,25 @@ struct Pixels {
     int height = 0;
     std::vector<std::uint8_t> bgra;  // top-down, 4 bytes per pixel
 };
+
+constexpr int kPresentTimeoutMs = 3000;  // a frame comes every few ms; a save load can hold one back
+
+// Wine (and Proton) export wine_get_version from ntdll; Windows does not.
+bool UnderWine() {
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll != nullptr && GetProcAddress(ntdll, "wine_get_version") != nullptr;
+}
+
+// The game's own frame, copied from its back buffer right before Present.
+bool CapturePresent(Pixels& out, std::string& error) {
+    FramePixels frame;
+    error = CapturePresentedFrame(kPresentTimeoutMs, frame);
+    if (!error.empty()) return false;
+    out.width = frame.width;
+    out.height = frame.height;
+    out.bgra = std::move(frame.bgra);
+    return true;
+}
 
 bool AllBlack(const Pixels& px) {
     for (std::size_t i = 0; i < px.bgra.size(); i += 4) {
@@ -160,14 +180,35 @@ ScreenshotResult TakeScreenshot(const std::filesystem::path& folder, std::string
     }
     const HWND hwnd = reinterpret_cast<HWND>(w.handle);
     Pixels px;
-    r.method = "print_window";
-    if (!Capture(hwnd, w, false, px) || AllBlack(px)) {
-        // PrintWindow draws nothing for some swap chains; the screen copy needs the window uncovered.
-        r.method = "screen";
+    std::string present_error;
+    // Under Wine the game draws through Vulkan (DXVK): GDI sees no frame, and the screen copy
+    // reads the X root window, black under Wayland. The back buffer at Present has it.
+    const bool wine = UnderWine();
+    bool captured = false;
+    if (wine && PresentHooked()) {
+        r.method = "present";
+        captured = CapturePresent(px, present_error) && !AllBlack(px);
+    }
+    if (!captured) {
         px = {};
-        if (!Capture(hwnd, w, true, px)) {
-            r.error = "neither PrintWindow nor a screen copy worked";
-            return r;
+        r.method = "print_window";
+        if (!Capture(hwnd, w, false, px) || AllBlack(px)) {
+            // PrintWindow draws nothing for some swap chains; the screen copy needs the window uncovered.
+            r.method = "screen";
+            px = {};
+            if (!Capture(hwnd, w, true, px)) {
+                r.error = "neither PrintWindow nor a screen copy worked";
+                if (!present_error.empty()) r.error += "; the frame at Present: " + present_error;
+                return r;
+            }
+        }
+        // Both black on Windows too: the frame at Present is the last try.
+        if (AllBlack(px) && !wine && PresentHooked()) {
+            Pixels frame;
+            if (CapturePresent(frame, present_error) && !AllBlack(frame)) {
+                px = std::move(frame);
+                r.method = "present";
+            }
         }
     }
     r.blank = AllBlack(px);

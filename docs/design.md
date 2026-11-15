@@ -629,7 +629,50 @@ change them.
 
 `PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT)` into a 32-bit DIB, with a
 copy from the screen as fallback when the result is all black; PNG through
-WIC, into `anvil/data/tongs/screenshots/`, the newest 100 kept.
+WIC, into `anvil/data/tongs/screenshots/`, the newest 100 kept. Under Wine
+(Proton included) the frame at Present comes first (below); on Windows it is
+the last try, when both other captures are all black. `method` names the
+capture that gave the picture: `present`, `print_window` or `screen`.
+
+### The frame at Present (2026-11-15)
+
+Under Proton on a Linux Wayland session every screenshot came back blank
+(seen with Tongs 0.34). Hypothesis, not checked capture by capture: the game's
+Direct3D 9 runs on Vulkan there (DXVK), so GDI's `PrintWindow` has no frame to
+draw, and the screen copy reads the X root window, which XWayland leaves
+black.
+
+The game itself always has the frame. `GfxPresentDX9` (Steam RVA `0x16D4DB0`,
+named from the eu4.pdb GOG ships) shows each frame with one call of
+`IDirect3DDevice9::Present` through vtable slot 17:
+`mov rax,[rcx]; call [rax+0x88]`, with `rcx` the device, followed by the check
+for `S_PRESENT_OCCLUDED` (`0x08760878`). symbols.toml `present_call` is that
+call (Steam `0x16D4DCE`, GOG `0x16BEC1E`, verified with `anvil check --exe`
+against all three builds), and Tongs puts a mid hook on it. The hook reads one
+atomic flag per frame and does nothing else until `screenshot` asks; then, on
+the main thread and before the frame is shown, it copies the back buffer:
+`GetBackBuffer`, `StretchRect` into a plain render target when the back buffer
+is multisampled, `GetRenderTargetData` into a system-memory surface, `LockRect`.
+32-bit `X8R8G8B8` and `A8R8G8B8` only; alpha is set to `0xFF`. The pipe
+thread waits up to 3 s for a frame and encodes the PNG itself, so the main
+thread spends only the copy. This does not depend on the compositor, the
+window being covered or the session type. It needs only the COM interface of
+the device the game passes, so Tongs neither links `d3d9.lib` nor makes a
+device of its own.
+
+Tongs tells Wine apart by `wine_get_version` in `ntdll.dll`, which Wine and
+Proton export and Windows does not. On Windows the order stays as it was
+(`print_window`, then `screen`), and the frame at Present is only the last try,
+when both are all black; that path was not run on Windows.
+
+Live check (2026-11-15, Steam 1.37.5 under Proton, Wayland session, 1920x1080
+borderless): `screenshot` answered `method: present`, `blank: false` on the
+loading screen (the Europe map with the engine and studio logos, the Anvil
+badge and a loading tip), in the main menu (logo, Continue Game, the menu
+buttons and the version box `EU4 v1.37.5.0`) and in a game (the top bar,
+the outliner, the minimap and the map of Iberia with the army icons and their
+selection panel), 2.7-3.2 MB each. The PNGs were read back and showed those
+frames.
 
 ### Live check (2026-10-17)
 

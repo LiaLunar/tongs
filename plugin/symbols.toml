@@ -2623,3 +2623,13 @@ note = "the country a unit belongs to: its tag's characters in the first bytes o
 build."eu4-1.37.5-steam-win64" = { rva = 0xD46770 }
 build."eu4-1.37.5.2-gog-win64" = { rva = 0xD44F20 }
 build."eu4-1.37.5.0-gog-win64" = { rva = 0xD44F20 }
+
+# --- Screenshots (docs/design.md, "Screenshots") ---
+
+[symbol.present_call]
+bytes = "48 8B 01 FF 90 88 00 00 00 85 C0 78 16 3D 78 08 76 08"
+memory = "code"
+note = "GfxPresentDX9: device->Present(0, 0, 0, 0) through vtable slot 17 (+0x88), rcx the IDirect3DDevice9; S_PRESENT_OCCLUDED (0x08760878) checked after it"
+build."eu4-1.37.5-steam-win64" = { rva = 0x16D4DCE }
+build."eu4-1.37.5.2-gog-win64" = { rva = 0x16BEC1E }
+build."eu4-1.37.5.0-gog-win64" = { rva = 0x16BEC1E }
