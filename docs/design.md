@@ -3805,6 +3805,26 @@ select to the start or the end), Ctrl+C or Ctrl+Insert (copy), Ctrl+V or
 Shift+Insert (paste), Ctrl+X or Shift+Delete (cut). Any other key goes to the
 field's listeners. There is no Shift+arrow selection and no Ctrl+A.
 
+### Clicks with modifier keys (2026-11-15)
+
+The game's map and its widgets ask `IsShiftDown`, `IsControlDown` and
+`IsAltDown` (above) while they handle a click, not the SDL event's state (an
+`SDL_MouseButtonEvent` has no modifier field). So `mods=` of `click` and
+`ui click` queues the modifier keys' `SDL_KEYDOWN` (Ctrl, Alt, Shift, each
+event's `mod` the keys down after it, as for a chord), waits 50 ms (a few
+frames), queues the press and release, waits the usual settle time with the
+keys still held, then queues the `SDL_KEYUP` in reverse. Holding them across
+frames keeps the keys down even when the game handles the click later in the
+frame than its event loop. `ui click` holds them only after its hover check,
+so a refusal presses no key; the keys come up also when the press fails.
+
+Live check (2026-11-15, Steam 1.37.5 under Proton, Russia 1719): a click on the
+map icon of the army in Caceres, then `click 1110 633 mods=shift` on the one in
+Jaén: `unit drill stop selected` counted 1, then 2 (nothing posted, neither
+army drilled), and the screenshot showed the panel `2 Armies` with both. A plain
+click on Jaén selected one again (Shift had come up);
+`ui click unit_mapicon[9]/holder_shield mods=shift` added Caceres, 2 again.
+
 ## Input gaps, round 2 (2026-11-11)
 
 The input paths round 1 left open: selection in text fields, the German and
