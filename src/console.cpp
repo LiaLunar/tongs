@@ -96,13 +96,66 @@ ConsoleRefusal CheckConsoleName(const GameCallPolicy& policy, std::string_view n
     return {};
 }
 
+namespace {
+constexpr std::uint32_t kStarted = 1, kIronman = 2, kMultiplayer = 4, kSuspended = 8;
+}  // namespace
+
+void GameCallSessionWatch::Suspended(bool suspended) {
+    if (suspended) {
+        bits_.fetch_or(kSuspended, std::memory_order_acq_rel);
+    } else {
+        bits_.fetch_and(~kSuspended, std::memory_order_acq_rel);
+    }
+}
+
+void GameCallSessionWatch::Session(bool started, bool ironman, bool multiplayer) {
+    std::uint32_t old = bits_.load(std::memory_order_acquire);
+    std::uint32_t next;
+    do {
+        next = old & kSuspended;
+        if (started) next |= kStarted | (ironman ? kIronman : 0) | (multiplayer ? kMultiplayer : 0);
+    } while (!bits_.compare_exchange_weak(old, next, std::memory_order_acq_rel));
+}
+
+GameCallSession GameCallSessionWatch::Read() const {
+    const std::uint32_t b = bits_.load(std::memory_order_acquire);
+    return {(b & kStarted) != 0, (b & kIronman) != 0, (b & kMultiplayer) != 0, (b & kSuspended) != 0};
+}
+
+bool GameCallPolicy::ActsInIronman() const {
+    const GameCallSession s = Session();
+    return s.Acts() && s.ironman;
+}
+
+bool GameCallPolicy::ActsInMultiplayer() const {
+    const GameCallSession s = Session();
+    return s.Acts() && s.multiplayer;
+}
+
+namespace {
+ConsoleRefusal IronmanRefusal() {
+    return {"ironman", "game calls are refused in ironman unless the player allows Tongs and its Game calls "
+                       "module there (allow_ironman = [\"tongs\", \"tongs.game_calls\"] in anvil/anvil.toml)"};
+}
+
+ConsoleRefusal MultiplayerRefusal() {
+    return {"multiplayer", "game calls are refused in multiplayer unless the player allows Tongs and its Game calls "
+                           "module there (allow_multiplayer = [\"tongs\", \"tongs.game_calls\"] in anvil/anvil.toml)"};
+}
+}  // namespace
+
+ConsoleRefusal CheckModuleSuspended(const GameCallPolicy& policy) {
+    const GameCallSession s = policy.Session();
+    if (!s.suspended) return {};
+    if (s.started && s.ironman) return IronmanRefusal();
+    if (s.started && s.multiplayer) return MultiplayerRefusal();
+    return {"game_calls_suspended", "Anvil suspended Tongs' Game calls module in the session in progress"};
+}
+
 ConsoleRefusal CheckConsoleMode(const GameCallPolicy& policy, const ConsoleRaw& raw) {
-    if (raw.ironman && !policy.ironman) {
-        return {"ironman", "game calls are refused in ironman (game_calls_ironman = true lifts this)"};
-    }
-    if (raw.multiplayer && !policy.multiplayer) {
-        return {"multiplayer", "game calls are refused in multiplayer (game_calls_multiplayer = true lifts this)"};
-    }
+    if (ConsoleRefusal r = CheckModuleSuspended(policy); r.refused()) return r;
+    if (raw.ironman && !policy.ActsInIronman()) return IronmanRefusal();
+    if (raw.multiplayer && !policy.ActsInMultiplayer()) return MultiplayerRefusal();
     return {};
 }
 

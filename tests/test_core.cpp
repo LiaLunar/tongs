@@ -16,6 +16,7 @@
 #include "ui_tree.hpp"
 #include "world.hpp"
 #include "world_flags.hpp"
+#include "world_reads.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -37,6 +38,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -44,6 +46,12 @@
 using namespace tongs;
 
 static bool Contains(const std::string& text, const char* part) { return text.find(part) != std::string::npos; }
+
+// A game_calls module in a session Anvil judged: `ironman` / `multiplayer` its mode, and the
+// module suspended there unless `allowed` (the player's allow_ironman / allow_multiplayer).
+static std::function<GameCallSession()> JudgedSession(bool ironman, bool multiplayer, bool allowed) {
+    return [=] { return GameCallSession{true, ironman, multiplayer, !allowed}; };
+}
 
 static std::uint64_t SteadyMs() {
     return static_cast<std::uint64_t>(
@@ -59,10 +67,12 @@ public:
     explicit FakeMainThread(Dispatcher& d) : thread_([this, &d] {
         std::uint64_t frame = 0;
         while (!stop_) {
-            d.RunBatch(++frame);
+            if (!held_) d.RunBatch(++frame);
             SleepMs(2);
         }
     }) {}
+    // Held: no frames, as while the game loads.
+    void Hold(bool held) { held_ = held; }
     ~FakeMainThread() {
         stop_ = true;
         thread_.join();
@@ -70,6 +80,7 @@ public:
 
 private:
     std::atomic<bool> stop_{false};
+    std::atomic<bool> held_{false};
     std::thread thread_;
 };
 
@@ -590,6 +601,60 @@ static void TestLoadWatch() {
     assert(read(true, 0x6000, "1719.3.1") != third);
 }
 
+static void TestOosView() {
+    OosView view;
+    const std::uint32_t both = ANVIL_GAME_OOS_DETECTED | ANVIL_GAME_OOS_PAUSED;
+    const auto apply = [&view](bool in_game, std::uint64_t load, std::uint64_t frame, std::uint32_t flags) {
+        StateSnapshot s;
+        s.in_game = in_game;
+        s.load = load;
+        s.out_of_sync = s.paused_oos = true;  // ReadState leaves them false; the view decides
+        view.Apply(s, frame, flags);
+        return std::pair{s.out_of_sync, s.paused_oos};
+    };
+    assert(apply(false, 0, 10, both) == std::pair(false, false));  // no game
+    // The first read of a load: the flags are as of a frame before it, so neither yet.
+    assert(apply(true, 1, 10, both) == std::pair(false, false));
+    assert(apply(true, 1, 10, both) == std::pair(false, false));
+    // Frame 11 is stored before anvil-game updates its flags for frame 11 (lab night review K2):
+    // a read in that gap still has frame 10's flags, so 11 does not settle the load yet.
+    assert(apply(true, 1, 11, both) == std::pair(false, false));
+    assert(apply(true, 1, 12, both) == std::pair(true, true));
+    assert(apply(true, 1, 13, ANVIL_GAME_OOS_PAUSED) == std::pair(false, true));
+    assert(apply(true, 1, 14, ANVIL_GAME_OOS_DETECTED) == std::pair(true, false));
+    // A resync loads a save: the old session's flags until a whole frame of the new one ran.
+    assert(apply(false, 0, 14, both) == std::pair(false, false));
+    assert(apply(true, 2, 14, both) == std::pair(false, false));
+    assert(apply(true, 2, 15, both) == std::pair(false, false));
+    assert(apply(true, 2, 16, 0) == std::pair(false, false));
+    assert(apply(true, 2, 17, both) == std::pair(true, true));
+}
+
+static void TestModeView() {
+    ModeView view;
+    const auto apply = [&view](bool in_game, std::uint64_t load, std::uint64_t frame, bool ironman, bool multiplayer) {
+        StateSnapshot s;
+        s.in_game = in_game;
+        s.load = load;
+        s.mode_known = s.ironman = s.multiplayer = true;  // the view decides
+        AnvilGameSession mode{};
+        mode.ironman = ironman ? 1 : 0;
+        mode.multiplayer = multiplayer ? 1 : 0;
+        view.Apply(s, frame, mode);
+        return std::tuple{s.mode_known, s.ironman, s.multiplayer};
+    };
+    assert(apply(false, 0, 10, true, true) == std::tuple(false, false, false));  // no game
+    // The first read of a load: session() is as of a frame before it, so nothing yet.
+    assert(apply(true, 1, 10, true, false) == std::tuple(false, false, false));
+    assert(apply(true, 1, 11, true, false) == std::tuple(false, false, false));  // frame 11 may still be running
+    assert(apply(true, 1, 12, true, false) == std::tuple(true, true, false));
+    assert(apply(true, 1, 13, false, false) == std::tuple(true, false, false));
+    // Another save loaded from a running game: the old session's flags until a whole frame of the new one ran.
+    assert(apply(true, 2, 13, false, false) == std::tuple(false, false, false));
+    assert(apply(true, 2, 14, false, true) == std::tuple(false, false, false));
+    assert(apply(true, 2, 15, false, true) == std::tuple(true, false, true));
+}
+
 // The 0.12 default config.toml, which a player may still have.
 constexpr char kOldDefaultConfig[] =
     "# Tongs\n"
@@ -619,11 +684,12 @@ static void TestConfig() {
 
     // Game calls: off by default, each switch on its own line.
     const Config defaults = ParseConfig(kOldDefaultConfig);
-    assert(!defaults.game_calls.enabled && !defaults.game_calls.ironman && !defaults.game_calls.multiplayer);
+    assert(!defaults.game_calls.enabled && !defaults.legacy_game_calls_ironman && !defaults.legacy_game_calls_multiplayer);
     assert(defaults.game_calls.allow.empty());
     const Config calls = ParseConfig(
         "game_calls = true\ngame_calls_ironman = true\ngame_calls_multiplayer = false\nconsole_allow = [\"leak\", \"oos\"] # two\n");
-    assert(calls.game_calls.enabled && calls.game_calls.ironman && !calls.game_calls.multiplayer && calls.notes.empty());
+    assert(calls.game_calls.enabled && calls.legacy_game_calls_ironman && !calls.legacy_game_calls_multiplayer &&
+           calls.notes.empty());
     assert(calls.game_calls.allow == std::vector<std::string>({"leak", "oos"}));
     assert(ParseConfig("console_allow = []\n").notes.empty());
     const Config bad_list = ParseConfig("console_allow = leak\nconsole_allow = [\"a b\"]\n");
@@ -712,6 +778,16 @@ static void TestProtocol() {
     assert(Contains(HandleRequest("state", h), "\"paused_oos\":false,\"map_mode\":37,\"map_mode_id\":null,\"session\":3,"));
     snapshot.map_mode = 0;
     assert(Contains(HandleRequest("state", h), "\"game_calls_total\":0,\"client_calls_total\":0"));
+    // The session's mode, once ModeView knows it.
+    assert(!Contains(HandleRequest("state", h), "\"ironman\""));
+    snapshot.mode_known = true;
+    snapshot.ironman = true;
+    assert(Contains(HandleRequest("state", h), "\"map_mode_id\":null,\"ironman\":true,\"multiplayer\":false,\"session\":3,"));
+    snapshot.ironman = false;
+    snapshot.multiplayer = true;
+    assert(Contains(HandleRequest("state", h), "\"ironman\":false,\"multiplayer\":true,\"session\":3,"));
+    snapshot.in_game = false;
+    assert(!Contains(HandleRequest("state", h), "\"ironman\""));
 
     assert(JsonEscape("a\"b\\c\n\x01") == "a\\\"b\\\\c\\n\\u0001");
 }
@@ -2289,16 +2365,58 @@ static void TestConsoleRules() {
     assert(CheckConsoleName(policy, "enable_all_commands").refused());  // console_allow cannot lift it
     assert(CheckConsoleName(policy, "oos").refused());
 
+    // The mode: Anvil's opt-ins of the game_calls module, as its session events tell them.
     ConsoleRaw raw;
     assert(!CheckConsoleMode(policy, raw).refused());
     raw.ironman = true;
-    assert(CheckConsoleMode(policy, raw).error == "ironman");
-    policy.ironman = true;
-    assert(!CheckConsoleMode(policy, raw).refused());
+    assert(CheckConsoleMode(policy, raw).error == "ironman");  // no session judged: never
+    policy.session = JudgedSession(true, false, false);
+    assert(CheckConsoleMode(policy, raw).error == "ironman");  // suspended: not allowed in ironman
+    policy.session = JudgedSession(true, false, true);
+    assert(!CheckConsoleMode(policy, raw).refused() && policy.ActsInIronman() && !policy.ActsInMultiplayer());
     raw.multiplayer = true;
-    assert(CheckConsoleMode(policy, raw).error == "multiplayer");
-    policy.multiplayer = true;
+    assert(CheckConsoleMode(policy, raw).error == "multiplayer");  // the session was judged as ironman only
+    policy.session = JudgedSession(true, true, true);
     assert(!CheckConsoleMode(policy, raw).refused());
+    policy.session = JudgedSession(true, true, false);
+    assert(CheckConsoleMode(policy, raw).error == "ironman");
+    raw.ironman = false;
+    policy.session = JudgedSession(false, true, true);
+    assert(!CheckConsoleMode(policy, raw).refused() && policy.ActsInMultiplayer());
+
+    // Anvil's verdict alone refuses, whatever Tongs read of the mode (night review K4).
+    raw = ConsoleRaw{};
+    policy.session = nullptr;
+    assert(!CheckModuleSuspended(policy).refused());
+    policy.session = JudgedSession(true, false, false);
+    assert(CheckModuleSuspended(policy).error == "ironman" && CheckConsoleMode(policy, raw).error == "ironman");
+    policy.session = JudgedSession(false, true, false);
+    assert(CheckConsoleMode(policy, raw).error == "multiplayer");
+    policy.session = JudgedSession(false, false, false);  // suspended in a session judged as neither
+    assert(CheckConsoleMode(policy, raw).error == "game_calls_suspended");
+    policy.session = [] { return GameCallSession{false, false, false, true}; };  // suspended before any session
+    assert(CheckModuleSuspended(policy).error == "game_calls_suspended");
+    policy.session = JudgedSession(true, false, true);
+    assert(!CheckModuleSuspended(policy).refused() && !CheckConsoleMode(policy, raw).refused());
+    policy.session = nullptr;
+
+    // The watch behind the session: the policy's anvil.suspended comes before anvil-game.session.
+    GameCallSessionWatch watch;
+    assert(!watch.Read().started && !watch.Read().Acts());
+    watch.Suspended(true);
+    watch.Session(true, true, false);
+    GameCallSession s = watch.Read();
+    assert(s.started && s.ironman && !s.multiplayer && s.suspended && !s.Acts());
+    watch.Suspended(false);  // resumed as the session ends
+    watch.Session(false, true, false);
+    s = watch.Read();
+    assert(!s.started && !s.ironman && !s.suspended);
+    watch.Session(true, true, true);  // a session the player allows: no anvil.suspended
+    s = watch.Read();
+    assert(s.Acts() && s.ironman && s.multiplayer);
+    watch.Session(true, false, false);  // a normal game after it
+    s = watch.Read();
+    assert(s.Acts() && !s.ironman && !s.multiplayer);
 
     assert(CheckConsoleAllow({"leak", "social_joinroom", "speed"}).size() == 2);
 }
@@ -2411,11 +2529,15 @@ static void TestConsoleCommand() {
     allow.game_calls.allow = {"oos"};
     assert(Contains(HandleRequest("console oos", allow), "\"ok\":true") && console.calls.size() == made + 1);
 
-    // Ironman and multiplayer refuse every game call, unless the switch lifts it; then `mode` shows it.
+    // Ironman and multiplayer refuse every game call, unless Anvil lets the module act there;
+    // then `mode` shows it.
     console.raw.ironman = true;
     assert(Contains(HandleRequest("console echo x", h), "\"error\":\"ironman\""));
+    Handlers not_allowed = h;
+    not_allowed.game_calls.session = JudgedSession(true, false, false);
+    assert(Contains(HandleRequest("console echo x", not_allowed), "\"error\":\"ironman\""));
     Handlers ironman = h;
-    ironman.game_calls.ironman = true;
+    ironman.game_calls.session = JudgedSession(true, false, true);
     out = HandleRequest("console echo x", ironman);
     assert(Contains(out, "\"ok\":true") && Contains(out, "\"mode\":{\"ironman\":true,\"multiplayer\":false,"));
     assert(console.log.back().first == 2 && Contains(console.log.back().second, "called in ironman"));
@@ -3950,65 +4072,64 @@ static void TestWorldParsing() {
            r.timeout_ms == 5000);
     assert(ParseWorldRequest("player", "RUS", r).error == "bad_command");
 
-    // The game's hash: the upper-cased characters summed, & 0x3F.
-    assert(TagBucket("RUS", 0x3F) == (('R' + 'U' + 'S') & 0x3F) && TagBucket("rus", 0x3F) == TagBucket("RUS", 0x3F));
     assert(Thousandths(4000) == "4" && Thousandths(4500) == "4.5" && Thousandths(1234) == "1.234" &&
            Thousandths(0) == "0" && Thousandths(-250) == "-0.25" && Thousandths(15000) == "15");
 }
 
 // A fake anvil-game.world for the flags and variables (world_flags.cpp).
 namespace fake_world {
+AnvilResult Result(int r) { return static_cast<AnvilResult>(r); }
 int flag_result = 0, names_result = 0;
 std::vector<std::pair<std::int32_t, std::string>> flag_names = {{3, "rus_reform_done"}, {9, "peter_the_great"}};
-std::vector<GameFlag> flags;  // what country_flags / province_flags answer
+std::vector<AnvilGameFlag> flags;  // what country_flags / province_flags answer
 std::string names;            // NUL-separated, as the service writes them
 std::vector<std::pair<std::string, std::int32_t>> values;
 
-int FlagName(std::int32_t id, char* utf8, std::uint32_t capacity, std::uint32_t* length) {
+AnvilResult FlagName(std::int32_t id, char* utf8, std::uint32_t capacity, std::uint32_t* length) {
     for (const auto& [i, n] : flag_names) {
         if (i != id) continue;
         *length = static_cast<std::uint32_t>(n.size() + 1);
         std::snprintf(utf8, capacity, "%s", n.c_str());
-        return 0;
+        return Result(0);
     }
-    return 11;
+    return Result(11);
 }
-int Flags(GameFlag* out, std::uint32_t capacity, std::uint32_t* count) {
-    if (flag_result != 0) return flag_result;
+AnvilResult Flags(AnvilGameFlag* out, std::uint32_t capacity, std::uint32_t* count) {
+    if (flag_result != 0) return Result(flag_result);
     *count = static_cast<std::uint32_t>(flags.size());
     for (std::uint32_t i = 0; i < capacity && i < flags.size(); ++i) out[i] = flags[i];
-    return 0;
+    return Result(0);
 }
-int CountryFlags(const char* tag, GameFlag* out, std::uint32_t capacity, std::uint32_t* count) {
-    return std::string(tag) == "RUS" ? Flags(out, capacity, count) : 11;
+AnvilResult CountryFlags(const char* tag, AnvilGameFlag* out, std::uint32_t capacity, std::uint32_t* count) {
+    return Result(std::string(tag) == "RUS" ? Flags(out, capacity, count) : 11);
 }
-int ProvinceFlags(std::int32_t province, GameFlag* out, std::uint32_t capacity, std::uint32_t* count) {
-    return province == 295 ? Flags(out, capacity, count) : 11;
+AnvilResult ProvinceFlags(std::int32_t province, AnvilGameFlag* out, std::uint32_t capacity, std::uint32_t* count) {
+    return Result(province == 295 ? Flags(out, capacity, count) : 11);
 }
-int Names(char* out, std::uint32_t capacity, std::uint32_t* length) {
-    if (names_result != 0) return names_result;
+AnvilResult Names(char* out, std::uint32_t capacity, std::uint32_t* length) {
+    if (names_result != 0) return Result(names_result);
     *length = static_cast<std::uint32_t>(names.size());
     if (names.size() <= capacity) std::memcpy(out, names.data(), names.size());
-    return 0;
+    return Result(0);
 }
-int Value(const char* name, std::int32_t* value) {
+AnvilResult Value(const char* name, std::int32_t* value) {
     for (const auto& [n, v] : values) {
         if (n == name) {
             *value = v;
-            return 0;
+            return Result(0);
         }
     }
-    return 11;
+    return Result(11);
 }
-int CountryNames(const char*, char* out, std::uint32_t capacity, std::uint32_t* length) { return Names(out, capacity, length); }
-int ProvinceNames(std::int32_t, char* out, std::uint32_t capacity, std::uint32_t* length) { return Names(out, capacity, length); }
-int CountryValue(const char*, const char* name, std::int32_t* value) { return Value(name, value); }
-int ProvinceValue(std::int32_t, const char* name, std::int32_t* value) { return Value(name, value); }
+AnvilResult CountryNames(const char*, char* out, std::uint32_t capacity, std::uint32_t* length) { return Result(Names(out, capacity, length)); }
+AnvilResult ProvinceNames(std::int32_t, char* out, std::uint32_t capacity, std::uint32_t* length) { return Result(Names(out, capacity, length)); }
+AnvilResult CountryValue(const char*, const char* name, std::int32_t* value) { return Result(Value(name, value)); }
+AnvilResult ProvinceValue(std::int32_t, const char* name, std::int32_t* value) { return Result(Value(name, value)); }
 
-GameFlag Flag(std::int32_t id, std::int32_t year, std::uint32_t month, std::uint32_t day) {
-    GameFlag f{};
+AnvilGameFlag Flag(std::int32_t id, std::int32_t year, std::uint32_t month, std::uint32_t day) {
+    AnvilGameFlag f{};
     f.id = id;
-    f.date.size = sizeof(WorldDate);
+    f.date.size = sizeof(AnvilGameDate);
     f.date.year = year;
     f.date.month = month;
     f.date.day = day;
@@ -4018,85 +4139,85 @@ GameFlag Flag(std::int32_t id, std::int32_t year, std::uint32_t month, std::uint
 // Pending events (Anvil 1.21): RUS waits for 5 (a country event) and 8 (hidden, in province 295).
 int pending_result = 0;
 std::vector<std::int32_t> pending_ids;
-int PendingEvents(const char* tag, std::int32_t* ids, std::uint32_t capacity, std::uint32_t* count) {
-    if (pending_result != 0) return pending_result;
-    if (std::string(tag) != "RUS") return 11;
+AnvilResult PendingEvents(const char* tag, std::int32_t* ids, std::uint32_t capacity, std::uint32_t* count) {
+    if (pending_result != 0) return Result(pending_result);
+    if (std::string(tag) != "RUS") return Result(11);
     *count = static_cast<std::uint32_t>(pending_ids.size());
     for (std::uint32_t i = 0; i < capacity && i < pending_ids.size(); ++i) ids[i] = pending_ids[i];
-    return 0;
+    return Result(0);
 }
-int PendingEvent(std::int32_t id, GamePendingEvent* out) {
-    if (id != 5 && id != 8) return 11;  // 9: chosen between the two calls
+AnvilResult PendingEvent(std::int32_t id, AnvilGamePendingEvent* out) {
+    if (id != 5 && id != 8) return Result(11);  // 9: chosen between the two calls
     out->pending_id = id;
     out->province = id == 8 ? 295 : 0;
     out->options = id == 8 ? 1 : 3;
     out->flags = id == 8 ? 1 : 0;
-    out->auto_select = {sizeof(WorldDate), 1719, 7, 17, 1};
-    return 0;
+    out->auto_select = {sizeof(AnvilGameDate), 1719, 7, 17, 1};
+    return Result(0);
 }
-int Text(const char* text, char* utf8, std::uint32_t capacity, std::uint32_t* length) {
+AnvilResult Text(const char* text, char* utf8, std::uint32_t capacity, std::uint32_t* length) {
     *length = static_cast<std::uint32_t>(std::strlen(text));
     std::snprintf(utf8, capacity, "%s", text);
-    return 0;
+    return Result(0);
 }
-int PendingKey(std::int32_t id, char* utf8, std::uint32_t capacity, std::uint32_t* length) {
-    return Text(id == 8 ? "flavor_zim.4" : "flavor_rus.1", utf8, capacity, length);
+AnvilResult PendingKey(std::int32_t id, char* utf8, std::uint32_t capacity, std::uint32_t* length) {
+    return Result(Text(id == 8 ? "flavor_zim.4" : "flavor_rus.1", utf8, capacity, length));
 }
-int PendingTitle(std::int32_t id, char* utf8, std::uint32_t capacity, std::uint32_t* length) {
-    return Text(id == 8 ? "" : "flavor_rus.1.t", utf8, capacity, length);
+AnvilResult PendingTitle(std::int32_t id, char* utf8, std::uint32_t capacity, std::uint32_t* length) {
+    return Result(Text(id == 8 ? "" : "flavor_rus.1.t", utf8, capacity, length));
 }
 
 // Diplomacy (Anvil 1.22): what each call answers for RUS; the player is RUS unless `player_tag` says otherwise.
 int relations_result = 0;
-std::vector<GameRelation> relations[8];
-std::vector<GameTag> rivals, subjects;
+std::vector<AnvilGameRelation> relations[8];
+std::vector<AnvilGameTag> rivals, subjects;
 std::string overlord, player_tag = "RUS";
-GameTag Tag(const char* text) {
-    GameTag t{};
+AnvilGameTag Tag(const char* text) {
+    AnvilGameTag t{};
     std::snprintf(t.text, sizeof(t.text), "%s", text);
     return t;
 }
-int Player(GameTag* out) {
+AnvilResult Player(AnvilGameTag* out) {
     *out = Tag(player_tag.c_str());
-    return 0;
+    return Result(0);
 }
-int Relations(const char* tag, std::uint32_t kind, GameRelation* out, std::uint32_t capacity, std::uint32_t* count) {
-    if (relations_result != 0) return relations_result;
-    if (kind > 7) return 1;
+AnvilResult Relations(const char* tag, std::uint32_t kind, AnvilGameRelation* out, std::uint32_t capacity, std::uint32_t* count) {
+    if (relations_result != 0) return Result(relations_result);
+    if (kind > 7) return Result(1);
     const auto& list = relations[kind];
     *count = static_cast<std::uint32_t>(list.size());
     for (std::uint32_t i = 0; i < capacity && i < list.size(); ++i) out[i] = list[i];
-    return std::string(tag) == "XXX" ? 11 : 0;
+    return Result(std::string(tag) == "XXX" ? 11 : 0);
 }
-int SubjectType(const char* overlord_tag, const char* subject, char* utf8, std::uint32_t capacity, std::uint32_t* length) {
-    if (std::string(overlord_tag) != "RUS" || std::string(subject) != "KAZ") return 11;
-    return Text("tributary_state", utf8, capacity, length);
+AnvilResult SubjectType(const char* overlord_tag, const char* subject, char* utf8, std::uint32_t capacity, std::uint32_t* length) {
+    if (std::string(overlord_tag) != "RUS" || std::string(subject) != "KAZ") return Result(11);
+    return Result(Text("tributary_state", utf8, capacity, length));
 }
-int Status(const char* from, const char* to, GameDiplomacyStatus* out) {
-    if (std::string(from) == "BYZ" || std::string(to) == "BYZ") return 11;  // no provinces
+AnvilResult Status(const char* from, const char* to, AnvilGameDiplomacyStatus* out) {
+    if (std::string(from) == "BYZ" || std::string(to) == "BYZ") return Result(11);  // no provinces
     out->opinion = std::string(from) == "RUS" ? -108 : -200;
     out->timed_sum = std::string(from) == "RUS" ? -399 : 0;
     out->trust = std::string(from) == "RUS" ? 99 : 50;
     out->favors = std::string(from) == "RUS" ? 37590 : 0;
     out->flags = 1;
-    return 0;
+    return Result(0);
 }
-int TagList(const std::vector<GameTag>& list, GameTag* out, std::uint32_t capacity, std::uint32_t* count) {
+AnvilResult TagList(const std::vector<AnvilGameTag>& list, AnvilGameTag* out, std::uint32_t capacity, std::uint32_t* count) {
     *count = static_cast<std::uint32_t>(list.size());
     for (std::uint32_t i = 0; i < capacity && i < list.size(); ++i) out[i] = list[i];
-    return 0;
+    return Result(0);
 }
-int Rivals(const char*, GameTag* out, std::uint32_t capacity, std::uint32_t* count) { return TagList(rivals, out, capacity, count); }
-int Subjects(const char*, GameTag* out, std::uint32_t capacity, std::uint32_t* count) { return TagList(subjects, out, capacity, count); }
-int Overlord(const char*, GameTag* out) {
-    if (overlord.empty()) return 11;
+AnvilResult Rivals(const char*, AnvilGameTag* out, std::uint32_t capacity, std::uint32_t* count) { return Result(TagList(rivals, out, capacity, count)); }
+AnvilResult Subjects(const char*, AnvilGameTag* out, std::uint32_t capacity, std::uint32_t* count) { return Result(TagList(subjects, out, capacity, count)); }
+AnvilResult Overlord(const char*, AnvilGameTag* out) {
+    if (overlord.empty()) return Result(11);
     *out = Tag(overlord.c_str());
-    return 0;
+    return Result(0);
 }
 
-GameWorldService Table() {
-    GameWorldService w{};
-    w.size = sizeof(GameWorldService);
+AnvilGameWorldService Table() {
+    AnvilGameWorldService w{};
+    w.size = sizeof(AnvilGameWorldService);
     w.player = Player;
     w.country_relations = Relations;
     w.subject_type = SubjectType;
@@ -4119,6 +4240,162 @@ GameWorldService Table() {
 }
 }  // namespace fake_world
 
+// A fake anvil-game.world for province, country and player (world_reads.cpp): provinces 1..4941,
+// 295 owned by RUS with a long non-ASCII name and two cores, 1 an unowned wasteland; RUS with two
+// provinces, BYZ with none, O00 the observer.
+namespace fake_reads {
+AnvilResult Result(int r) { return static_cast<AnvilResult>(r); }
+int phase = 0;  // nonzero: province, country and player_tags answer it
+std::string name295 = std::string(300, 'x') + "\xC3\x96sterg\xC3\xB6tland";
+std::uint32_t player_flags = 0;
+std::string own = "RUS", observed = "", acting = "RUS";
+AnvilGameTag Tag(const std::string& text) {
+    AnvilGameTag t{};
+    std::snprintf(t.text, sizeof(t.text), "%s", text.c_str());
+    return t;
+}
+std::int32_t Limit() { return phase != 0 ? 0 : 4942; }
+AnvilResult Province(std::int32_t id, AnvilGameProvince* out) {
+    if (phase != 0) return Result(phase);
+    if (id < 1 || id >= 4942) return ANVIL_ERROR_NOT_FOUND;
+    if (id == 666) return ANVIL_ERROR_INTERNAL;
+    const std::uint32_t size = out->size;
+    *out = {};
+    out->size = size;
+    out->id = id;
+    out->owner = Tag(id == 295 ? "RUS" : "");
+    out->controller = Tag(id == 295 ? "SWE" : "");
+    out->base_tax = 4500;
+    out->base_production = 3000;
+    out->base_manpower = 1000;
+    out->flags = id == 1 ? ANVIL_GAME_PROVINCE_LAND | ANVIL_GAME_PROVINCE_WASTELAND : ANVIL_GAME_PROVINCE_LAND;
+    return ANVIL_OK;
+}
+AnvilResult ProvinceName(std::int32_t id, char* utf8, std::uint32_t capacity, std::uint32_t* length) {
+    const std::string name = id == 295 ? name295 : "Stockholm";
+    *length = static_cast<std::uint32_t>(name.size());
+    if (capacity != 0) {
+        const std::size_t fits = std::min<std::size_t>(name.size(), capacity - 1);
+        std::memcpy(utf8, name.data(), fits);
+        utf8[fits] = '\0';
+    }
+    return ANVIL_OK;
+}
+AnvilResult ProvinceCores(std::int32_t id, AnvilGameTag* out, std::uint32_t capacity, std::uint32_t* count) {
+    std::vector<AnvilGameTag> cores;
+    if (id == 295) cores = {Tag("RUS"), Tag("SWE")};
+    if (id == 2) {
+        for (int i = 0; i < 70; ++i) cores.push_back(Tag("A" + std::to_string(10 + i)));
+    }
+    *count = static_cast<std::uint32_t>(cores.size());
+    for (std::uint32_t i = 0; i < capacity && i < cores.size(); ++i) out[i] = cores[i];
+    return ANVIL_OK;
+}
+AnvilResult Country(const char* tag, AnvilGameCountry* out) {
+    if (phase != 0) return Result(phase);
+    const std::string t = tag;
+    if (t != "RUS" && t != "rus" && t != "BYZ" && t != "O00") return ANVIL_ERROR_NOT_FOUND;
+    const std::uint32_t size = out->size;
+    *out = {};
+    out->size = size;
+    out->tag = Tag(t == "rus" ? "RUS" : t);
+    out->capital = t == "BYZ" || t == "O00" ? 0 : 295;
+    out->province_count = t == "BYZ" || t == "O00" ? 0 : 2;
+    out->flags = t == "O00" ? ANVIL_GAME_COUNTRY_OBSERVER : 0;
+    return ANVIL_OK;
+}
+AnvilResult CountryProvinces(const char* tag, std::int32_t* ids, std::uint32_t capacity, std::uint32_t* count) {
+    const std::string t = tag;
+    const std::vector<std::int32_t> list = t == "RUS" || t == "rus" ? std::vector<std::int32_t>{295, 310} : std::vector<std::int32_t>{};
+    *count = static_cast<std::uint32_t>(list.size());
+    for (std::uint32_t i = 0; i < capacity && i < list.size(); ++i) ids[i] = list[i];
+    return ANVIL_OK;
+}
+AnvilResult PlayerTags(AnvilGamePlayer* out) {
+    if (phase != 0) return Result(phase);
+    out->tag = Tag(acting);
+    out->own = Tag(own);
+    out->observed = Tag(observed);
+    out->flags = player_flags;
+    return ANVIL_OK;
+}
+AnvilGameWorldService Table() {
+    AnvilGameWorldService w{};
+    w.size = sizeof(AnvilGameWorldService);
+    w.province_limit = Limit;
+    w.province = Province;
+    w.province_name = ProvinceName;
+    w.province_cores = ProvinceCores;
+    w.country = Country;
+    w.country_provinces = CountryProvinces;
+    w.player_tags = PlayerTags;
+    return w;
+}
+}  // namespace fake_reads
+
+static void TestWorldReads() {
+    using namespace fake_reads;
+    const AnvilGameWorldService w = Table();
+    ProvinceRaw p;
+    assert(!ReadProvince(&w, 295, p).failed());
+    assert(p.id == 295 && p.owner == "RUS" && p.controller == "SWE" && p.base_tax == 4500 && p.base_production == 3000 &&
+           p.base_manpower == 1000 && p.land && !p.wasteland && p.name == name295 && p.cores.size() == 2 &&
+           p.cores[0] == "RUS" && p.cores[1] == "SWE");
+    assert(Contains(ProvinceMembers(p), "\"owner\":\"RUS\"") && Contains(ProvinceMembers(p), "\"base_tax\":4.5"));
+    // An unowned wasteland: owner and controller null in the answer, no cores.
+    assert(!ReadProvince(&w, 1, p).failed() && p.owner.empty() && p.controller.empty() && p.wasteland && p.cores.empty() &&
+           p.name == "Stockholm");
+    assert(Contains(ProvinceMembers(p), "\"owner\":null"));
+    // More cores than the first call has room for.
+    assert(!ReadProvince(&w, 2, p).failed() && p.cores.size() == 70 && p.cores[69] == "A79");
+    // The valid range comes from province_limit, as Tongs' own walk gave it.
+    WorldFailure f = ReadProvince(&w, 4942, p);
+    assert(f.error == "unknown_province" && f.detail == "no province 4942 (valid IDs 1..4941)");
+    assert(ReadProvince(&w, 0, p).error == "unknown_province");
+    f = ReadProvince(&w, 666, p);
+    assert(f.error == "read_failed" && f.detail == "province answered 10");
+    // The fields only: what navigation checks.
+    assert(!ReadProvinceFields(&w, 1, p).failed() && p.land && p.wasteland && p.name.empty());
+
+    CountryRaw c;
+    assert(!ReadCountry(&w, "rus", c).failed());
+    assert(c.tag == "RUS" && c.province_count == 2 && c.provinces == std::vector<std::int32_t>({295, 310}) && c.capital == 295 &&
+           c.capital_valid && !c.observer);
+    assert(Contains(CountryMembers(c), "\"exists\":true,\"province_count\":2,\"provinces\":[295,310],\"capital\":295"));
+    // A country without provinces: exists false, capital null.
+    assert(!ReadCountry(&w, "BYZ", c).failed() && c.province_count == 0 && c.provinces.empty() && !c.capital_valid);
+    assert(Contains(CountryMembers(c), "\"exists\":false,\"province_count\":0,\"provinces\":[],\"capital\":null"));
+    assert(!ReadCountry(&w, "O00", c).failed() && c.observer);
+    f = ReadCountry(&w, "XXX", c);
+    assert(f.error == "unknown_country" && f.detail == "the game knows no country XXX");
+
+    PlayerRaw pl;
+    assert(!ReadPlayer(&w, pl).failed() && pl.tag == "RUS" && pl.player_tag == "RUS" && pl.observed_tag.empty() && !pl.observer);
+    assert(PlayerMembers(pl) == ",\"tag\":\"RUS\",\"player_tag\":\"RUS\",\"observed_tag\":null,\"observer\":false");
+    own = acting = "O01";
+    player_flags = ANVIL_GAME_PLAYER_OBSERVER;
+    assert(!ReadPlayer(&w, pl).failed() && pl.tag == "O01" && pl.observer);
+    own = "O00", observed = "TUR", acting = "TUR";
+    assert(!ReadPlayer(&w, pl).failed());
+    assert(PlayerMembers(pl) == ",\"tag\":\"TUR\",\"player_tag\":\"O00\",\"observed_tag\":\"TUR\",\"observer\":true");
+    own = acting = "RUS", observed = "";
+    player_flags = 0;
+
+    // Outside a session (or before its first outer frame) the service refuses: not_in_game.
+    phase = ANVIL_ERROR_WRONG_PHASE;
+    assert(ReadProvince(&w, 295, p).error == "not_in_game");
+    assert(ReadCountry(&w, "RUS", c).error == "not_in_game");
+    assert(ReadPlayer(&w, pl).error == "not_in_game");
+    phase = 0;
+
+    // No service, or one without player_tags: unavailable.
+    assert(ReadProvince(nullptr, 295, p).error == "unavailable" && ReadCountry(nullptr, "RUS", c).error == "unavailable");
+    AnvilGameWorldService old = Table();
+    old.size = static_cast<std::uint32_t>(offsetof(AnvilGameWorldService, player_tags));
+    f = ReadPlayer(&old, pl);
+    assert(f.error == "unavailable" && Contains(f.detail, "Anvil 1.23"));
+}
+
 constexpr const char* kEmptyDiplomacy = "{\"alliance\":[],\"royal_marriage\":[],\"guarantee\":[],\"military_access\":[],\"giving_military_access\":[],\"subsidies\":[],\"dependency\":[],\"warning\":[],\"rivals\":[],\"overlord\":null,\"subjects\":[],\"player\":null,\"toward_player\":null,\"player_toward\":null}";
 
 static void TestWorldFlagsAndVariables() {
@@ -4126,7 +4403,7 @@ static void TestWorldFlagsAndVariables() {
     flags = {Flag(3, 1700, 1, 1), Flag(9, 1719, 3, 17)};
     names = std::string("reforms\0", 8) + std::string("debt_ratio\0", 11);
     values = {{"reforms", 3000}, {"debt_ratio", -1250}};
-    GameWorldService w = Table();
+    AnvilGameWorldService w = Table();
     assert(HasFlags(&w) && HasVariables(&w));
 
     ScopeExtras e;
@@ -4175,8 +4452,8 @@ static void TestWorldFlagsAndVariables() {
     flag_result = 0;
 
     // An older Anvil: the table ends at selected_units (1.15) or there is no service.
-    GameWorldService old = Table();
-    old.size = static_cast<std::uint32_t>(offsetof(GameWorldService, monarch));
+    AnvilGameWorldService old = Table();
+    old.size = static_cast<std::uint32_t>(offsetof(AnvilGameWorldService, monarch));
     assert(!HasFlags(&old) && !HasVariables(&old));
     ReadCountryExtras(&old, "RUS", e);
     assert(Contains(ExtrasMembers(e), "\"flags\":null,\"variables\":null,\"pending_events\":null,\"diplomacy\":null,\"missing\":{\"flags\":"
@@ -4197,11 +4474,11 @@ static void TestWorldFlagsAndVariables() {
 
 static void TestWorldDiplomacy() {
     using namespace fake_world;
-    GameWorldService w = Table();
+    AnvilGameWorldService w = Table();
     assert(HasDiplomacy(&w));
-    GameRelation ally{Tag("RUS"), Tag("TUR"), {sizeof(WorldDate), 1700, 1, 1, 1}, {}};
-    GameRelation vassal{Tag("RUS"), Tag("KAZ"), {sizeof(WorldDate), 1650, 2, 3, 1}, {}};
-    GameRelation warned{Tag("SWE"), Tag("RUS"), {sizeof(WorldDate), 1718, 2, 18, 1}, {sizeof(WorldDate), 1720, 1, 1, 1}};
+    AnvilGameRelation ally{Tag("RUS"), Tag("TUR"), {sizeof(AnvilGameDate), 1700, 1, 1, 1}, {}};
+    AnvilGameRelation vassal{Tag("RUS"), Tag("KAZ"), {sizeof(AnvilGameDate), 1650, 2, 3, 1}, {}};
+    AnvilGameRelation warned{Tag("SWE"), Tag("RUS"), {sizeof(AnvilGameDate), 1718, 2, 18, 1}, {sizeof(AnvilGameDate), 1720, 1, 1, 1}};
     relations[0] = {ally};
     relations[6] = {vassal};
     relations[7] = {warned};
@@ -4240,8 +4517,8 @@ static void TestWorldDiplomacy() {
     assert(e.pending_read);
     relations_result = 0;
     // A 1.21 table: pending events but no diplomacy. Provinces never have it.
-    GameWorldService old = Table();
-    old.size = static_cast<std::uint32_t>(offsetof(GameWorldService, country_relations));
+    AnvilGameWorldService old = Table();
+    old.size = static_cast<std::uint32_t>(offsetof(AnvilGameWorldService, country_relations));
     assert(!HasDiplomacy(&old) && HasPending(&old));
     ReadCountryExtras(&old, "RUS", e);
     assert(Contains(ExtrasMembers(e), ",\"diplomacy\":null,\"missing\":{\"diplomacy\":\"anvil-game.world has no diplomacy: it "
@@ -4257,7 +4534,7 @@ static void TestWorldDiplomacy() {
 
 static void TestWorldPendingEvents() {
     using namespace fake_world;
-    GameWorldService w = Table();
+    AnvilGameWorldService w = Table();
     assert(HasPending(&w));
     pending_ids = {5, 9, 8};  // 9 is chosen between the list and its read
     ScopeExtras e;
@@ -4282,8 +4559,8 @@ static void TestWorldPendingEvents() {
     assert(Contains(ExtrasMembers(e), "\"pending_events\":\"this game build has no pending event symbols (pending_events)\""));
     pending_result = 0;
     // A 1.20 table: flags and variables, no pending events. Provinces never have the list.
-    GameWorldService old = Table();
-    old.size = static_cast<std::uint32_t>(offsetof(GameWorldService, pending_events));
+    AnvilGameWorldService old = Table();
+    old.size = static_cast<std::uint32_t>(offsetof(AnvilGameWorldService, pending_events));
     assert(!HasPending(&old) && HasFlags(&old));
     ReadCountryExtras(&old, "RUS", e);
     assert(Contains(ExtrasMembers(e), ",\"pending_events\":null,\"diplomacy\":null,\"missing\":{\"pending_events\":\"anvil-game."
@@ -4731,12 +5008,12 @@ static void TestNavigationCommands() {
     assert(Contains(out, "\"ok\":true") && Contains(out, "\"game_call\":true,\"game_calls_total\":1") &&
            !Contains(out, "client_calls_total"));
 
-    // In ironman with the switch on, the answer says so (ADR 0001).
+    // In ironman with the module allowed there, the answer says so (ADR 0001).
     ConsoleRaw console;
     console.ironman = true;
     console.session = 1;
     Handlers ironman = h;
-    ironman.game_calls.ironman = true;
+    ironman.game_calls.session = JudgedSession(true, false, true);
     ironman.read_console = [&console](ConsoleRaw& raw) {
         raw = console;
         return std::string();
@@ -4929,6 +5206,14 @@ static void TestSaveLoadCommand(bool fault = false) {
     assert(Contains(HandleRequest("save load x", h), "\"error\":\"unreadable_save\""));
     file = FromHex("45553462696e4d2801000c00d0228203692c01000f000500782e657534382a01000f00030041524d893501000e0001");
     assert(Contains(HandleRequest("save load x", h), "\"error\":\"ironman_save\""));
+    // From an ironman game that allows the module: the ironman save gets past that check.
+    Handlers ironman_load = h;
+    ironman_load.game_calls.session = JudgedSession(true, false, true);
+    game.paused = false;  // stops at the next check, before any call
+    assert(Contains(HandleRequest("save load x", ironman_load), "\"error\":\"not_paused\"") && loads == 0);
+    game.paused = true;
+    ironman_load.game_calls.session = JudgedSession(true, false, false);
+    assert(Contains(HandleRequest("save load x", ironman_load), "\"error\":\"ironman_save\""));
     file = FromHex("45553462696e4d2801000c00d0228203692c01000f000500782e657534382a01000f00030041524d");
     game.paused = false;
     out = HandleRequest("save load x", h);
@@ -4976,10 +5261,15 @@ static void TestSaveLoadCommand(bool fault = false) {
     };
     assert(Contains(HandleRequest("save load x", h), "\"error\":\"ironman\""));
     Handlers ironman = h;
-    ironman.game_calls.ironman = true;
+    ironman.game_calls.session = JudgedSession(true, false, true);
     out = HandleRequest("save load x", ironman);
     assert(Contains(out, "\"called\":true") && Contains(out, "\"mode\":{\"ironman\":true,\"multiplayer\":false,"));
     h.read_console = nullptr;
+    // Without a console read, Anvil's suspension of the module still refuses (night review K4).
+    Handlers suspended_mp = h;
+    suspended_mp.game_calls.session = JudgedSession(false, true, false);
+    out = HandleRequest("save load x", suspended_mp);
+    assert(Contains(out, "\"error\":\"multiplayer\"") && !Contains(out, "\"called\":true"));
 
     // A load longer than the timeout: the answer comes at the timeout, the effect unknown; the
     // load is still a game call, and shows as one when it ends.
@@ -5266,6 +5556,51 @@ static void TestSaveLoadAchievementsNotice() {
     };
     out = HandleRequest("save load x dismiss=achievements", h);
     assert(Contains(out, "\"ok\":true") && !Contains(out, "\"dismissed\"") && clicks == 1);
+
+    // Ok closes the notice, then the load holds the main thread past the timeout: not "blocked".
+    to_menu();
+    h.read_continue_flag = [&](bool& set) {
+        if (flag) {
+            flag = false;
+            notice = true;
+        }
+        set = flag;
+        return true;
+    };
+    h.send_input = [&](const std::vector<InputEvent>& events) {
+        for (const InputEvent& e : events) {
+            if (e.type != InputEvent::Type::MouseUp || !over_ok()) continue;
+            ++clicks;
+            notice = false;
+        }
+        return std::string();
+    };
+    h.release_cursor = [&] {
+        cursor = {-1, -1};
+        if (!notice) main.Hold(true);
+    };
+    out = HandleRequest("save load x dismiss=achievements timeout=3", h);
+    main.Hold(false);
+    assert(!Contains(out, "\"error\":\"blocked\"") && Contains(out, "\"called\":true"));
+    assert(Contains(out, "\"dismissed\":\"achievements_notice\",\"dismiss_clicks\":1") && clicks == 2 && !notice);
+
+    // A click that is not sent is no dismissal: the notice stays open and the answer says blocked.
+    to_menu();
+    h.release_cursor = [&cursor] { cursor = {-1, -1}; };
+    h.send_input = [](const std::vector<InputEvent>&) { return std::string("the window is minimised"); };
+    out = HandleRequest("save load x dismiss=achievements timeout=3", h);
+    assert(Contains(out, "\"error\":\"blocked\"") && !Contains(out, "\"dismiss") && notice);
+    assert(Contains(out, "whose Ok could not be clicked: ") && Contains(out, "the window is minimised"));
+    assert(!Contains(out, "stayed open after its Ok was clicked"));
+
+    // Its client leaving ends the wait at once: no click, and the answer says so.
+    to_menu();
+    const int clicks_before = clicks;
+    {
+        const ClientScope scope([] { return true; });
+        out = HandleRequest("save load x dismiss=achievements timeout=20", h);
+    }
+    assert(Contains(out, "\"error\":\"client_left\"") && Contains(out, "\"called\":true") && clicks == clicks_before);
 
     // The click is an input: without input = true the option is refused before anything is called.
     to_menu();
@@ -5878,7 +6213,7 @@ static void TestActivityGate() {
     };
     run(h, kClient, promote);
     assert(promoted.error == "ironman");
-    h.game_calls.ironman = true;
+    h.game_calls.session = JudgedSession(true, false, true);
     const ActivityGate::Counts counts = gate.counts();
     logged.clear();
     run(h, kClient, promote, 7);
@@ -5890,7 +6225,11 @@ static void TestActivityGate() {
     assert(logged.size() == 1 && logged[0] == std::make_pair(kLogWarning, "a client call x (pipe 7, " + earlier +
                                                                               "): made as a game call: it discovers a capital"));
     h.read_console = nullptr;
-    h.game_calls.ironman = false;
+    // Without a console read, Anvil's suspension of the module still refuses (night review K4).
+    h.game_calls.session = JudgedSession(true, false, false);
+    run(h, kClient, promote);
+    assert(promoted.error == "ironman");
+    h.game_calls.session = nullptr;
     Handlers tripped = h;
     tripped.gate = MakeActivityGate();
     tripped.gate->Trip(Breaker::GameCalls);
@@ -5999,7 +6338,7 @@ static void TestCommandTable() {
             continue;
         }
         const std::string refused = HandleRequest(line, off);
-        assert(Contains(refused, c.type == CommandType::GameCall ? "game_calls = true" : "input = true") &&
+        assert(Contains(refused, c.type == CommandType::GameCall ? "tongs.game_calls" : "input = true") &&
                Contains(refused, "\"ok\":false"));
         assert(Contains(HandleRequest(line, suspended), "Anvil suspended Tongs"));
     }
@@ -6070,6 +6409,7 @@ int main(int argc, char** argv) {
     TestCommandTable();
     TestWorldParsing();
     TestWorldAnswers();
+    TestWorldReads();
     TestWorldFlagsAndVariables();
     TestWorldPendingEvents();
     TestWorldDiplomacy();
@@ -6114,6 +6454,8 @@ int main(int argc, char** argv) {
     TestRunUntilEventsFirstService();
     TestDate();
     TestLoadWatch();
+    TestOosView();
+    TestModeView();
     TestScreenshot();
     TestThreads();
     TestTextEvents();

@@ -107,6 +107,9 @@ std::string StateFields(const StateSnapshot& s) {
     out += std::string(",\"paused_oos\":") + Bool(s.paused_oos);
     out += ",\"map_mode\":" + std::to_string(s.map_mode);
     out += ",\"map_mode_id\":" + (s.map_mode_id != nullptr ? "\"" + JsonEscape(s.map_mode_id) + "\"" : std::string("null"));
+    if (s.mode_known) {
+        out += std::string(",\"ironman\":") + Bool(s.ironman) + ",\"multiplayer\":" + Bool(s.multiplayer);
+    }
     if (s.load != 0) out += ",\"session\":" + std::to_string(s.load);
     return out + process;
 }
@@ -1974,7 +1977,7 @@ std::string NavigationAct(const Handlers& h, const WorldRequest& request, Activi
                 // Opening this view posts a command: a game call (ADR 0003, promotion).
                 const Refusal r = a.Promote(
                     "opening this province's view would make the player discover its owner's capital, a change of game "
-                    "state; it needs game_calls = true",
+                    "state; it needs Tongs' Game calls module",
                     "the player discovers the owner's capital");
                 refusal = {r.error, r.detail};
             }
@@ -2272,9 +2275,11 @@ std::string SaveLoad(const Request& r, std::string_view argument) {
         if (std::string error = ReadSaveMeta(bytes, h.save_tokens, meta); !error.empty()) return refuse("unreadable_save", error);
         bytes.clear();
         bytes.shrink_to_fit();
-        if (meta.ironman && !h.game_calls.ironman) {
+        // Whether the player allows game calls in ironman is Anvil's (the module's opt-in), and
+        // Tongs learns it only in an ironman session (GameCallSession): outside one it refuses.
+        if (meta.ironman && !h.game_calls.ActsInIronman()) {
             return refuse("ironman_save", "the save is an ironman save, which the game would write to after the load; "
-                                          "it needs game_calls_ironman = true");
+                                          "Tongs loads one only from an ironman game that allows its Game calls module");
         }
         std::array<int, 4> running{};
         const bool version = h.read_version && h.read_version(running);
@@ -2343,6 +2348,11 @@ std::string SaveLoad(const Request& r, std::string_view argument) {
                         return std::string();
                     }
                     if (!before.paused) return refused("not_paused", "the game runs; a player loads from the paused in-game menu");
+                    if (ConsoleRefusal r = CheckModuleSuspended(hh.game_calls); r.refused()) {
+                        call->refusal = r.error;
+                        call->refusal_detail = r.detail;
+                        return std::string();
+                    }
                     if (hh.read_console) {
                         ConsoleRaw raw;
                         if (std::string error = hh.read_console(raw); !error.empty()) return refused("console_unavailable", error);
@@ -2429,10 +2439,24 @@ std::string SaveLoad(const Request& r, std::string_view argument) {
             // the load until it is closed (lab, 14.11.2026).
             const std::uint64_t t0 = h.now_ms();
             bool loaded = false;
-            bool noticed = false;  // the notice was open on the last look
-            int clicks = 0;        // dismiss=achievements: clicks on its Ok
+            bool noticed = false;  // the notice was open on the last look, and nothing since says it closed
+            int attempts = 0;      // dismiss=achievements: clicks tried on its Ok
+            int clicks = 0;        // ... and sent
             std::uint64_t next_look = 0;
+            std::string click_error;  // why the last click on Ok was not sent
+            // A cancel or the client leaving ends the wait, as every other wait: no more clicks, and
+            // the activity's turn goes back (the load itself may still go on).
+            const std::uint64_t generation = g_cancel_generation.load();
+            bool cancelled = false, client_left = false;
             for (;;) {
+                if (g_cancel_generation.load() != generation) {
+                    cancelled = true;
+                    break;
+                }
+                if (ClientLeft()) {
+                    client_left = true;
+                    break;
+                }
                 StateSnapshot seen;
                 bool loading = true, read = false;
                 const int left = deadline > h.now_ms() ? static_cast<int>(deadline - h.now_ms()) : 0;
@@ -2456,19 +2480,27 @@ std::string SaveLoad(const Request& r, std::string_view argument) {
                     loaded = true;
                     break;
                 }
-                if (frame.ran && seen.in_game) noticed = false;
+                // In game, or no frame for a while (the game is loading; a menu with the notice
+                // open draws many frames in that time): nothing holds the load.
+                if ((!frame.ran && left >= kNoticeLookMs) || seen.in_game) noticed = false;
                 if (frame.ran && looked) {
                     next_look = h.now_ms() + kNoticeLookMs;
                     const UiNotice notice = FindAchievementsNotice(tree);
                     noticed = notice.window != -1;
-                    if (noticed && dismiss && clicks < kMaxNoticeClicks) {
+                    if (noticed && dismiss && attempts < kMaxNoticeClicks) {
                         const UiWidget& ok = tree.widgets[notice.agree];
-                        ++clicks;
+                        ++attempts;
                         // One input of its own, counted when the part ends if the click was sent.
                         ActivityGate::Part part = a.CountAs("save load");
                         const ClickOutcome c = ClickWidget(part.handlers(), ok.address, ok.rect, left, false);
                         a.Log(kLogWarning, c.ok ? std::string("clicked Ok on the achievements notice")
                                                 : "could not click Ok on the achievements notice: " + c.error);
+                        if (c.ok) {
+                            ++clicks;
+                            noticed = false;  // until a later look sees it still open
+                        } else {
+                            click_error = c.error;
+                        }
                         if (h.release_cursor) {
                             h.release_cursor();
                             Hold({});
@@ -2479,14 +2511,29 @@ std::string SaveLoad(const Request& r, std::string_view argument) {
             }
             call->load_ms = h.now_ms() - t0;
             std::string notice_members;
-            if (clicks > 0) notice_members = ",\"dismissed\":\"achievements_notice\",\"dismiss_clicks\":" + std::to_string(clicks);
+            if (clicks > 0) {
+                // Dismissed only when the notice did not stay open after the clicks.
+                notice_members = std::string(!loaded && noticed ? "" : ",\"dismissed\":\"achievements_notice\"") +
+                                 ",\"dismiss_clicks\":" + std::to_string(clicks);
+            }
             called = ",\"called\":true,\"load_ms\":" + std::to_string(call->load_ms) + meta_members + ",\"via\":\"menu\"" +
                      notice_members;
+            if (cancelled || client_left) {
+                const std::uint64_t total = a.Total(call->before);
+                return refuse(cancelled ? "cancelled" : "client_left",
+                              std::string(cancelled ? "cancelled" : "its client left") +
+                                  " while the game was taking the load from the menu; the load may still go on",
+                              called + ",\"game_calls_total\":" + std::to_string(total));
+            }
             if (!loaded && noticed) {
                 const std::uint64_t total = a.Total(call->before);
                 return refuse("blocked",
                               std::string("the load waits behind Anbennar's notice \"") + std::string(kAchievementsNoticeTitle) +
-                                  "\"" + (dismiss ? ", which stayed open after its Ok was clicked" : "; dismiss=achievements clicks its Ok"),
+                                  "\"" +
+                                  (!dismiss         ? std::string("; dismiss=achievements clicks its Ok")
+                                   : clicks > 0     ? std::string(", which stayed open after its Ok was clicked")
+                                   : click_error.empty() ? std::string(", whose Ok was not found to click")
+                                                    : ", whose Ok could not be clicked: " + click_error),
                               called + ",\"blocked_by\":\"achievements_notice\",\"game_calls_total\":" + std::to_string(total));
             }
         } else if (call->load.result != 0) {

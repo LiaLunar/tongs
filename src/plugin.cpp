@@ -22,6 +22,7 @@
 #include "game_ui_service.hpp"
 #include "game_window.hpp"
 #include "game_world.hpp"
+#include "world_reads.hpp"
 #include "load_watch.hpp"
 #include "notify_sources.hpp"
 #include "pipe_server.hpp"
@@ -40,6 +41,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -69,6 +71,9 @@ std::uint64_t UnixNowMs() {
 // or multiplayer game the player did not allow it in (docs/design.md, "Gameplay").
 std::atomic<bool> g_suspended{false};
 
+// The game_calls module in the session in progress (console.hpp, GameCallSession).
+tongs::GameCallSessionWatch g_game_calls_session;
+
 struct Tongs : anvil::Plugin {
     // The activity gate of this instance (activity_gate.hpp): the counts, totals and breakers
     // of the pipe's commands and of tongs.navigation's calls.
@@ -77,7 +82,7 @@ struct Tongs : anvil::Plugin {
     void load(anvil::Host& host) override {
         // symbols.toml limits the plugin to the one build whose layout it declares.
         const std::filesystem::path data_dir = host.data_dir();
-        const tongs::Config config = tongs::LoadSettings(data_dir);
+        tongs::Config config = tongs::LoadSettings(data_dir);
         for (const auto& note : config.notes) host.warn("{}", note);
         const std::uintptr_t image_base = host.game().image_base;
         const tongs::UiLayout ui_layout = tongs::UiLayout::Load();
@@ -97,6 +102,26 @@ struct Tongs : anvil::Plugin {
             g_suspended.store(false, std::memory_order_release);
             host.info("resumed by Anvil: input commands, game calls and navigation are back");
         });
+        // Game calls are the game_calls module (plugin.toml): Anvil gives its handle only when the
+        // player turned it on, and suspends it by its own opt-ins (allow_ironman = ["tongs.game_calls"]).
+        try {
+            if (const std::optional<anvil::Host> game_calls = host.module("game_calls")) {
+                config.game_calls.enabled = true;
+                game_calls->subscribe(ANVIL_EVENT_SUSPENDED, [] { g_game_calls_session.Suspended(true); });
+                game_calls->subscribe(ANVIL_EVENT_RESUMED, [] { g_game_calls_session.Suspended(false); });
+                // Anvil's policy hears of a session before any plugin, so the module's
+                // anvil.suspended has come when this runs.
+                host.subscribe(ANVIL_GAME_EVENT_SESSION, [](const void* payload) {
+                    const auto* s = static_cast<const AnvilGameSession*>(payload);
+                    if (s == nullptr || s->size < offsetof(AnvilGameSession, multiplayer) + sizeof(s->multiplayer)) return;
+                    g_game_calls_session.Session(s->change == ANVIL_GAME_SESSION_STARTED, s->ironman != 0,
+                                                 s->multiplayer != 0);
+                });
+                config.game_calls.session = [] { return g_game_calls_session.Read(); };
+            }
+        } catch (const anvil::Error& e) {
+            host.warn("game calls off: {}", e.what());
+        }
         // tongs.navigation makes client calls for other plugins only (docs/adr/0004), whatever the settings.
         if (const std::string error = tongs::RegisterNavigationService(
                 image_base, [] { return g_suspended.load(std::memory_order_acquire); }, gate);
@@ -116,6 +141,11 @@ struct Tongs : anvil::Plugin {
             return;
         }
         const tongs::GameLayout game_layout = tongs::GameLayout::Load();
+        // anvil-game.world (plugin.toml requires the anvil-game with player_tags): the world reads,
+        // units, flags, pending events and diplomacy, and navigation's province checks.
+        const auto* world_service =
+            host.service<AnvilGameWorldService>(ANVIL_GAME_WORLD_SERVICE, ANVIL_GAME_WORLD_SERVICE_VERSION);
+        if (world_service == nullptr) host.warn("{} is missing: world reads answer unavailable", ANVIL_GAME_WORLD_SERVICE);
         const tongs::EventLayout event_layout = tongs::EventLayout::Load();
         tongs::Handlers handlers;
         handlers.gate = gate;
@@ -138,6 +168,16 @@ struct Tongs : anvil::Plugin {
         // Every state read also tells LoadWatch whether a game was loaded: the `session` number,
         // and a reloaded save starts game_calls_total and client_calls_total again.
         static tongs::LoadWatch load_watch;
+        // anvil-game.game: the out-of-sync flags for state, and the session's ironman and
+        // multiplayer flags for state and the console's mode (docs/design.md, "Out of sync" and
+        // "Session mode").
+        const auto* game = host.service<AnvilGameService>(ANVIL_GAME_SERVICE, ANVIL_GAME_SERVICE_VERSION);
+        if (game == nullptr) {
+            host.warn("{} is not loaded: out_of_sync stays false, state has no ironman or multiplayer and console refuses",
+                      ANVIL_GAME_SERVICE);
+        }
+        static tongs::OosView oos_view;
+        static tongs::ModeView mode_view;
         // anvil-map is optional: with it, state names the plugin mode a map mode number belongs to.
         // Its mode_id may be called from any thread, so the pipe thread asks it for the number it
         // just read and the id always matches that number.
@@ -147,10 +187,21 @@ struct Tongs : anvil::Plugin {
                                      map_modes->mode_id == nullptr)) {
             map_modes = nullptr;
         }
-        handlers.read_state = [image_base, game_layout, map_modes, pid = handlers.process_id,
+        handlers.read_state = [image_base, game_layout, map_modes, game, pid = handlers.process_id,
                                start_ms = handlers.process_start_ms] {
             tongs::StateSnapshot s = tongs::ReadState(image_base, game_layout);
             load_watch.Observe(s);
+            // frame_number() before the views it gates (FrameGate): a frame number read first is never
+            // newer than the flags and the session read after it.
+            const std::uint64_t frame = game != nullptr ? game->frame_number() : 0;
+            if (game != nullptr && ANVIL_GAME_HAS(game, out_of_sync)) {
+                const std::uint32_t flags = game->out_of_sync();
+                oos_view.Apply(s, frame, flags);
+            }
+            if (game != nullptr && s.in_game) {
+                AnvilGameSession mode{};
+                if (game->session(&mode) != 0) mode_view.Apply(s, frame, mode);
+            }
             if (s.in_game && map_modes != nullptr) s.map_mode_id = map_modes->mode_id(s.map_mode);
             s.pid = pid;
             s.process_start_ms = start_ms;
@@ -209,56 +260,52 @@ struct Tongs : anvil::Plugin {
             if (config.input) {
                 // run_until events=first chooses through anvil-game.commands version 2 when Anvil
                 // has it (docs/design.md, "Events"), and clicks otherwise. anvil-game loads first.
-                const auto* commands = host.service<tongs::GameCommandsService>(tongs::kGameCommandsService,
+                const auto* commands = host.service<AnvilGameCommandsService>(ANVIL_GAME_COMMANDS_SERVICE,
                                                                                tongs::kGameCommandsVersion);
-                if (commands != nullptr && commands->size >= offsetof(tongs::GameCommandsService, post) +
+                if (commands != nullptr && commands->size >= offsetof(AnvilGameCommandsService, post) +
                                                                 sizeof(commands->post)) {
                     AnvilPlugin* self = host.self();
                     handlers.choose_option = [commands, self](std::int32_t pending, std::int32_t option) {
                         return tongs::ChooseEventOption(commands, self, pending, option);
                     };
-                    host.info("run_until events=first chooses through {} v{}", tongs::kGameCommandsService,
+                    host.info("run_until events=first chooses through {} v{}", ANVIL_GAME_COMMANDS_SERVICE,
                               tongs::kGameCommandsVersion);
                 }
             }
             // Units (docs/design.md, "Units (0.31.0)"): anvil-game.world's units for `units`, and with
             // input anvil-game.commands version 1 for `unit drill|split|merge`.
-            const auto* world_service =
-                host.service<tongs::GameWorldService>(tongs::kGameWorldService, tongs::kGameWorldVersion);
             if (tongs::HasUnits(world_service)) {
                 handlers.read_units = [world_service](std::string_view tag, tongs::UnitsRaw& out) {
                     return tongs::ReadUnits(world_service, tag, out);
                 };
                 if (config.input) {
-                    const auto* unit_commands = host.service<tongs::GameCommandsService>(
-                        tongs::kGameCommandsService, tongs::kGameCommandsVersionUnits);
+                    const auto* unit_commands = host.service<AnvilGameCommandsService>(
+                        ANVIL_GAME_COMMANDS_SERVICE, tongs::kGameCommandsVersionUnits);
                     if (unit_commands != nullptr &&
-                        unit_commands->size >= offsetof(tongs::GameCommandsService, post) + sizeof(unit_commands->post)) {
+                        unit_commands->size >= offsetof(AnvilGameCommandsService, post) + sizeof(unit_commands->post)) {
                         AnvilPlugin* self = host.self();
                         handlers.post_units = [unit_commands, world_service, self](const tongs::UnitRequest& request) {
                             return tongs::PostUnits(unit_commands, world_service, self, request);
                         };
-                        host.info("unit drill, split and merge post through {} v{}", tongs::kGameCommandsService,
+                        host.info("unit drill, split and merge post through {} v{}", ANVIL_GAME_COMMANDS_SERVICE,
                                   tongs::kGameCommandsVersionUnits);
                     }
                 }
             }
-            // World reads (docs/design.md, "World reads (0.20.0)"): reads like ui, whatever the settings.
+            // World reads (docs/design.md, "World reads (0.20.0)"): reads like ui, whatever the settings, through
+            // anvil-game.world with their flags, variables, pending events and diplomacy; the selection is Tongs' own.
             const tongs::WorldLayout world = tongs::WorldLayout::Load();
-            // Their flags and variables come from anvil-game.world (Anvil 1.20; "Flags and variables").
-            handlers.read_province = [image_base, world, world_service](std::int32_t id, tongs::ProvinceRaw& out) {
-                tongs::WorldFailure f = tongs::ReadProvince(image_base, world, id, out);
+            handlers.read_province = [world_service](std::int32_t id, tongs::ProvinceRaw& out) {
+                tongs::WorldFailure f = tongs::ReadProvince(world_service, id, out);
                 if (!f.failed()) tongs::ReadProvinceExtras(world_service, out.id, out.extras);
                 return f;
             };
-            handlers.read_country = [image_base, world, world_service](std::string_view tag, tongs::CountryRaw& out) {
-                tongs::WorldFailure f = tongs::ReadCountry(image_base, world, tag, out);
+            handlers.read_country = [world_service](std::string_view tag, tongs::CountryRaw& out) {
+                tongs::WorldFailure f = tongs::ReadCountry(world_service, tag, out);
                 if (!f.failed()) tongs::ReadCountryExtras(world_service, out.tag, out.extras);
                 return f;
             };
-            handlers.read_player = [image_base, world](tongs::PlayerRaw& out) {
-                return tongs::ReadPlayer(image_base, world, out);
-            };
+            handlers.read_player = [world_service](tongs::PlayerRaw& out) { return tongs::ReadPlayer(world_service, out); };
             handlers.read_selection = [image_base, world](tongs::SelectionRaw& out) {
                 return tongs::ReadSelection(image_base, world, out);
             };
@@ -292,8 +339,8 @@ struct Tongs : anvil::Plugin {
                 };
                 handlers.read_loading = [image_base, save](bool& loading) { return tongs::ReadLoading(image_base, save, loading); };
                 const tongs::ConsoleLayout console_layout = tongs::ConsoleLayout::Load();
-                handlers.read_console = [image_base, console_layout](tongs::ConsoleRaw& raw) {
-                    return tongs::ReadGameConsole(image_base, console_layout, raw);
+                handlers.read_console = [image_base, console_layout, game](tongs::ConsoleRaw& raw) {
+                    return tongs::ReadGameConsole(image_base, console_layout, game, raw);
                 };
                 handlers.call_console = [image_base, console_layout](const std::vector<std::string>& tokens,
                                                                      tongs::ConsoleCallResult& result) {
@@ -306,8 +353,8 @@ struct Tongs : anvil::Plugin {
         if (config.input && handlers.dispatcher) {
             // Navigation (docs/design.md, "Navigation (0.21.0)"): client calls behind input.
             const tongs::NavigationLayout navigation = tongs::NavigationLayout::Load();
-            handlers.read_navigation = [image_base, navigation](std::int32_t id, tongs::NavigationFacts& out) {
-                return tongs::ReadNavigationFacts(image_base, navigation, id, out);
+            handlers.read_navigation = [image_base, navigation, world_service](std::int32_t id, tongs::NavigationFacts& out) {
+                return tongs::ReadNavigationFacts(image_base, navigation, world_service, id, out);
             };
             handlers.call_navigation = [image_base, navigation](bool open, const tongs::NavigationFacts& facts,
                                                                 unsigned long& fault_code) {
@@ -339,12 +386,11 @@ struct Tongs : anvil::Plugin {
         if (config.game_calls.enabled) {
             std::string allowed;
             for (const auto& name : config.game_calls.allow) allowed += (allowed.empty() ? "" : ", ") + name;
-            host.warn("game calls enabled: console commands can change game state{}{}{}",
-                      allowed.empty() ? "" : "; console_allow: " + allowed,
-                      config.game_calls.ironman ? "; allowed in ironman" : "",
-                      config.game_calls.multiplayer ? "; allowed in multiplayer" : "");
+            host.warn("game calls enabled (module tongs.game_calls): console commands can change game state{}; in "
+                      "ironman and multiplayer only where Anvil lets the module act",
+                      allowed.empty() ? "" : "; console_allow: " + allowed);
         } else {
-            host.info("game calls disabled (game_calls = false)");
+            host.info("game calls disabled (module tongs.game_calls is off)");
         }
         // The moment without a game while a save loads lasts a second or more; reads every 20 ms
         // see it even when no client asks, so `session` and the totals count every load.

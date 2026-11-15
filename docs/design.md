@@ -47,7 +47,8 @@ client without being asked.
 Actions in layers 2 and 3 go through the same path as a player's input, never
 by writing game state directly, so the game behaves as it would for a human
 player. Only layer 4 changes game state by running game code. It is off unless
-`game_calls = true`, and every game call is counted, so a measurement can
+the player turns on the `game_calls` module (0.35.0; before it the setting
+`game_calls = true`), and every game call is counted, so a measurement can
 reject a marked run.
 
 Beside the layers, for measurements: `run_until` / `wait_until` time the
@@ -163,8 +164,8 @@ gate applies the rules of the type, in this order:
 1. the command's checks of its arguments, where they come before the switch
    (`save load`; the other commands that parse first, such as `ui click` or
    `province open`, do it before they reach the gate);
-2. the switch: `input = true` for inputs and client calls, `game_calls = true`
-   for game calls;
+2. the switch: `input = true` for inputs and client calls, the `game_calls`
+   module for game calls;
 3. Anvil's suspension;
 4. the command's own checks (a reader that is not set up, a console command
    refused by name);
@@ -232,6 +233,36 @@ never has it. `paused_oos` is the game-speed object's `+0x19`. `CGameState::_bOu
 in GOG's `eu4.pdb` looks like the place, but the code only clears it. Both fields
 were matched between GOG and Steam and read as `false` in a single-player game;
 `true` has not been seen, because a real desync takes two computers.
+
+Since Anvil 1.23 Tongs no longer reads them itself: `anvil-game` declares the
+same three symbols and its `anvil-game.game` service answers them in
+`out_of_sync()` (`ANVIL_GAME_OOS_DETECTED`, `ANVIL_GAME_OOS_PAUSED`; anvil-game
+1.14), callable from any thread. Its view is as of the last outer frame, while
+the rest of `state` is read live. Between the read in which Tongs first sees a
+new load and the first outer frame of that session no frame runs, so the
+service may still hold the previous session's flags; a resync after a desync
+is exactly such a load. Tongs reports both fields `false` until
+`frame_number()` is two past the value it had at that read (`OosView`,
+`src/load_watch.cpp`): anvil-game stores a frame's number before it updates
+its views for that frame, so a read in between sees the new number with the
+old flags, and only the number after it proves that a whole frame of the new
+session ran. Tongs reads `frame_number()` before the flags, so the number it
+compares is never newer than what it reports. An out-of-sync flag that comes up in a running game
+shows in `state` one outer frame later than before, also in the `out_of_sync`
+notification. Without `anvil-game.game` both stay `false`.
+
+### Session mode
+
+`ironman` and `multiplayer` in `state` are Anvil's view of the session:
+`anvil-game.game`'s `session()`, the same flags Anvil uses to suspend a
+plugin in ironman or multiplayer and Tongs' console reads for its gates.
+Like `out_of_sync()` the view is as of the last outer frame, so Tongs
+leaves both fields out of `state` until a whole outer frame ran after the
+read that saw a new load (`ModeView`, `src/load_watch.cpp`, with the same
+gate as `OosView`), and without `anvil-game.game`. `multiplayer` is the
+game's own `is_multiplayer`: a host alone in a multiplayer lobby's game is
+not multiplayer until another player has joined. Reads keep working while
+Anvil suspends Tongs, so a client sees why its inputs are refused.
 
 ### Map mode
 
@@ -2038,8 +2069,8 @@ marked **live**.
 [ADR 0001](adr/0001-game-calls-in-tongs.md):
 
 - **Switches.**
-  - Game calls need `game_calls = true`; main-thread reads need only
-    `enabled`.
+  - Game calls need the `game_calls` module (see "The game_calls module
+    (0.35.0)"); main-thread reads need only `enabled`.
   - `plugin.toml` declares `affects_gameplay = true`; since Anvil 1.0 Anvil
     also suspends Tongs in ironman and multiplayer unless the player allows
     it (see "Anvil 1.0 (plugin API 2)").
@@ -2058,9 +2089,10 @@ marked **live**.
   every refusal here, so they would reopen `enable_all_commands`.
 - **Ironman and multiplayer.**
   - Tongs refuses every game call in either mode, checked before each call.
-  - `game_calls_ironman` and `game_calls_multiplayer` lift that refusal;
+  - Anvil's opt-ins of the `game_calls` module lift that refusal (until 0.34
+    Tongs' settings `game_calls_ironman` and `game_calls_multiplayer` did);
     both are off by default.
-  - With either on, the answer carries `mode`.
+  - In a game that allows them, the answer carries `mode`.
 - **Logging.** Every game call and every refusal is logged with the command,
   the pipe instance, the game date and the result.
 - **Counts.** Game calls are counted in `game_calls` and `game_calls_total`.
@@ -2074,8 +2106,13 @@ How it runs (`src/protocol.cpp`, `ConsoleCall`; decisions in
    refuses `game_calls_tripped`.
 2. With the turn held, a `Kind::GameCall` job is queued (limit 10 s). On
    the main thread it reads the state (`not_in_game` without a loaded game),
-   the manager, its entries and both locks, the ironman byte and
-   `0x6EAA10(session)`, and refuses by mode. It resolves the typed name in
+   the manager, its entries and both locks, and the session's ironman and
+   multiplayer flags, and refuses by mode. Since Anvil 1.23 the two flags
+   come from `anvil-game.game`'s `session()`, which reads the same byte and
+   call as of the outer frame the job runs after (`console_registration` and
+   `is_multiplayer` left `plugin/symbols.toml`); when the service has no
+   session yet, the call answers `console_unavailable` ("anvil-game reports
+   no session yet"). It resolves the typed name in
    the manager's entries as the game's lookup does (`unknown_command` when
    none matches, also when the developer gate is open and the game would try
    its console variables) and checks the refusals again by the entry's own
@@ -2692,10 +2729,12 @@ game call; the work queue has none of that.
 
 ### Settings
 
-`plugin/settings.toml` declares `enabled`, `input`, `game_calls`,
-`console_allow` (a string: names separated by commas or spaces, since
-settings have no lists), `game_calls_ironman` and `game_calls_multiplayer`,
-all off and `restart = true`: Tongs reads them once while loading. The
+`plugin/settings.toml` declares `enabled`, `input`, `journal`, `bridge`,
+`bridge_folder` and, under the `game_calls` module, `console_allow` (a
+string: names separated by commas or spaces, since settings have no lists),
+all `restart = true`: Tongs reads them once while loading. None changes the
+result of a game by itself (`affects_gameplay = false`, Anvil ADR 0013), so
+none is locked in a multiplayer game or in the multiplayer code. The
 player's values are in `anvil/data/tongs/settings.toml`;
 `ANVIL_TONGS_<NAME>` variables override them for one start.
 
@@ -2704,8 +2743,57 @@ does not, Tongs writes the config's non-default values to `settings.toml`
 (through a temporary file), renames the config to `config.toml.migrated`,
 logs it, and uses the config's values already in that start (Anvil read the
 defaults before the file existed), except where an `ANVIL_TONGS_<NAME>`
-variable is set. With both files present, `config.toml` is ignored with a
-warning.
+variable is set. Game calls are the exception: the config's `game_calls`,
+`game_calls_ironman` and `game_calls_multiplayer` are written as the retired
+settings below, which Anvil moves at the next start. With both files present,
+`config.toml` is ignored with a warning.
+
+### The game_calls module (0.35.0)
+
+Game calls are a module of Tongs (Anvil ADR 0011): `[[modules]] game_calls`
+in `plugin.toml`, `affects_gameplay = true`, both opt-ins offered, `default =
+false`. The module's switch and its ironman and multiplayer opt-ins are
+Anvil's (`enabled_modules`, `allow_ironman`, `allow_multiplayer` with the key
+`tongs.game_calls`), drawn under Tongs in Anvil Manager and the Anvil panel;
+Tongs no longer has settings that repeat them (Anvil ADR 0013, point 5, and
+the UI guidelines, §6).
+
+- **On.** `load` asks for the module's handle (`host.module("game_calls")`);
+  Anvil gives one only when the module is on at this start. With it, Tongs
+  sets up `console` and `save load`; without it they answer
+  `game_calls_disabled` and the discover case of `province open` answers
+  `needs_game_calls`, as `game_calls = false` did.
+- **Ironman and multiplayer.** Tongs makes its game calls by calling the
+  game's code itself, so no service of Anvil's checks them: Tongs refuses
+  them in either mode unless Anvil lets the module act there. It learns that
+  from the module's events (`GameCallSessionWatch`, `console.hpp`):
+  `anvil.suspended` / `anvil.resumed` through the module's handle, and
+  `anvil-game.session` through the plugin's. Anvil's gameplay policy hears of
+  a session before any plugin and suspends the module there unless the player
+  allowed it, so a session Tongs heard of with the module not suspended is
+  one the player allowed game calls in. Before Tongs has heard of the
+  session, a game call in ironman or multiplayer is refused.
+- **Both opt-ins.** The pipe and its other commands stay the plugin's: while
+  Anvil suspends Tongs itself, `console` answers `suspended` before the mode
+  is asked. A game call in ironman therefore needs `allow_ironman =
+  ["tongs", "tongs.game_calls"]`, as it needed both `allow_ironman =
+  ["tongs"]` and `game_calls_ironman = true` until 0.34.
+- **Ironman saves.** `save load` refuses an ironman save unless Tongs is in
+  an ironman session that allows game calls. Outside a session Tongs cannot
+  tell whether the player allows game calls in ironman (the opt-in is in
+  `anvil.toml`, which Anvil does not show plugins), so from the main menu it
+  refuses one; with 0.34's `game_calls_ironman = true` it loaded it.
+- **Retired settings.** `settings.toml` lists `[retired.game_calls]`
+  (`on = [true]`, `off = [false]`), `[retired.game_calls_ironman]`
+  (`ironman = [true]`) and `[retired.game_calls_multiplayer]`
+  (`multiplayer = [true]`). At the first start of 0.35, before it resolves
+  Tongs' modules, Anvil moves a player's value into `anvil.toml` (the module
+  into `enabled_modules`, or into `allow_ironman` / `allow_multiplayer`) and
+  removes it from `anvil/data/tongs/settings.toml`, so game calls stay as the
+  player had them from that same start. `ANVIL_TONGS_GAME_CALLS*` variables no
+  longer do anything: a lab script turns the module on in its copy's
+  `anvil.toml`, or writes `game_calls = true` to the player's file before the
+  start, which Anvil moves.
 
 ### Ironman and multiplayer
 
@@ -2716,9 +2804,13 @@ Tongs' cursor hook and nested-frame counter are out of the game, and Tongs
 gets `anvil.suspended`: until `anvil.resumed` its input commands (except
 `release`) answer an error and `console` answers `suspended`, while reads
 (`state`, `ui`, `event list`, `frames`, notifications) go on; `help` reports
-`suspended`. Tongs' own
-`game_calls_ironman` / `game_calls_multiplayer` stay a second layer: a game
-call in ironman needs both the player's opt-in in Anvil and Tongs' switch.
+`suspended`. Game calls are a second layer, the `game_calls` module with its
+own opt-ins: a game call in ironman needs both `"tongs"` and
+`"tongs.game_calls"` in `allow_ironman` (see "The game_calls module
+(0.35.0)"). Tongs refuses game calls on Anvil's verdict as well as on its own
+reading of the mode: while `anvil.suspended` holds the module, `console`,
+in-game `save load` and calls made as game calls are refused
+(`CheckModuleSuspended`), also where Tongs cannot read the console.
 
 ### Build
 
@@ -2980,6 +3072,74 @@ gave them, and Great Britain's lists showed its 4 allies, 2 rivals, 1 royal
 marriage and 3 subjects, as `diplomacy` did. With the Anvil 1.21.0 release
 `diplomacy` was again `null` with `missing` naming Anvil 1.22, while
 `pending_events` and the flags stayed.
+
+### Through anvil-game.world (Anvil 1.23)
+
+Anvil's `anvil-game.world` reads the same memory Tongs walked here: its walk
+was copied from this one. Two walks meant two places to fix after a game
+update, so `province`, `country` and `player` now take their values from the
+service (`src/world_reads.cpp`, in `tongs_core`, which touches only the service
+table, so the tests hand it one of their own), and Tongs' own walk for them is
+gone. Tongs needs Anvil 1.23.0, the first with `player_tags` (anvil#364). The
+answers keep their commands, fields and error names.
+
+- **The calls.** `province`: `province` (owner, controller, base values, the
+  land and wasteland flags), `province_name` (256 bytes, then the length the
+  first call gave) and `province_cores` (64 tags, then the count), on one
+  frame. `country`: `country` (the tag the game stores, the observer flag, the
+  province count, the capital) and `country_provinces`. `player`:
+  `player_tags` (`tag`, `own` as `player_tag`, `observed` as `observed_tag`,
+  `ANVIL_GAME_PLAYER_OBSERVER` as `observer`). Flags, variables, pending events
+  and diplomacy follow as before.
+- **Error names.** `ANVIL_ERROR_NOT_FOUND` is `unknown_province` (the detail
+  keeps "valid IDs 1..N", N from `province_limit`) or `unknown_country` (the
+  same sentence as before); `ANVIL_ERROR_WRONG_PHASE` is `not_in_game`; a
+  missing service, or a table without `player_tags`, is `unavailable`; any
+  other result is `read_failed` with the call and its result in the detail
+  (`"province answered 10"`), where Tongs' walk named the part it could not
+  read.
+- **The capital.** The service answers 0 for a capital outside
+  `1 .. province_limit - 1`; Tongs answers it as `null`, as before.
+- **What stays Tongs' own.** `selection` (the selection object and the
+  province view, `ReadSelection`) and what navigation reads before its calls:
+  the province object the game's calls take (from `camera_to_province_id`'s
+  array, checked by the ID it holds), the player's and the owner's country
+  index for the discovered-by bitset, the owner's capital object, the session,
+  the camera and the tutorial. Navigation's bound, land and wasteland come
+  from the service's `province` (`ReadProvinceFields`).
+- **Symbols.** 11 of 199 are gone: `province_count`, `province_is_sea`,
+  `province_is_wasteland`, `province_base_production`,
+  `province_base_manpower`, `province_controller`, `province_cores`,
+  `province_name`, `tag_buckets`, `country_exists`, `country_provinces`.
+  `province_base_tax` (an owner's tag and country index, the province's ID,
+  the country database) and `player_country` (the player's tags, the kind and
+  valid bytes) stay for navigation.
+- **The SDK's declarations.** The copies of `anvil-game.world` and
+  `anvil-game.commands` and of their structs in `src/game_commands.hpp` are
+  gone; Tongs uses `<anvil/anvil_game.h>` of the pinned SDK. The size checks
+  of the earlier subsections (`HasFlags`, `HasPending`, `HasDiplomacy`) stay
+  and now always pass.
+
+**After a load.** The service answers only after an outer frame of a session,
+on the main thread, from an `anvil-game` handler or queued work. Tongs' state
+says `in_game: true` 4 to 5 seconds before the first outer frame of a new
+session (lab `docs/anvil-world-player-game-test-2026-11-14.md`): Tongs reads
+the state off the main thread every 20 ms, while the game draws no outer frame
+until the load is done. World reads were already dispatcher read jobs, which
+run only after an outer frame, so they wait for that frame in the queue
+within the request's timeout (10 s, or `timeout=S`), as Tongs' own walk did,
+and answer `main thread busy` when the timeout passes first; no new error
+name. When the job runs, the frame is the session's and the service answers.
+Should the service still refuse there (Tongs' state in game, Anvil's session
+tracker not yet), the read answers `not_in_game` with a detail naming
+anvil-game.world, the name a client already sees while a load replaces the
+session. A client that waits with `ready` first is past that frame.
+
+**`tongs.navigation`.** Its header asks callers for the main thread after an
+outer frame, from an `anvil-game` handler or `run_on_main_thread`, where the
+service answers. A call on the main thread outside those (inside a game hook,
+say) used to read the world anyway; it now gets `TONGS_NAV_NOT_IN_GAME`
+(`open_province`), because the service refuses it.
 
 ## Navigation (0.21.0)
 
