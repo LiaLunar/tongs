@@ -54,6 +54,9 @@ group = "Game calls"
 [setting.instance]
 type = "string"
 default = ""
+# Only names the pipe and the bridge folder; the players of one multiplayer game give their copies
+# different names, so it must stay out of the multiplayer code.
+affects_gameplay = false
 label = "Instance name"
 description = "Leave empty for one game. To run several games on one computer, give each a different name of up to 32 letters, digits, _ or -: its pipe becomes \\\\.\\pipe\\tongs-NAME, and under Wine its bridge.json goes to a folder NAME below the default one. Clients choose the game with TONGS_INSTANCE=NAME or --instance NAME."
 
