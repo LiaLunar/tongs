@@ -64,6 +64,24 @@ bool ParseConsoleAllow(std::string_view text, std::vector<std::string>& out, std
     return true;
 }
 
+std::string PipeName(std::string_view instance) {
+    if (instance.empty()) return "tongs";
+    if (instance.size() > 32) return {};
+    // Windows compares pipe names without case, so "Host" and "host" are one pipe there: fold the name, so that it
+    // also means one game (one pipe, one bridge folder) under Wine.
+    std::string name = "tongs-";
+    for (const char c : instance) {
+        if (c >= 'A' && c <= 'Z') {
+            name += static_cast<char>(c - 'A' + 'a');
+        } else if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+            name += c;
+        } else {
+            return {};
+        }
+    }
+    return name;
+}
+
 Config ParseConfig(std::string_view text) {
     Config config;
     int line_number = 0;
